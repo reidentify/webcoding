@@ -2103,15 +2103,15 @@ async function runClaudeSettingsRestoreRegressionCase({ tempRoot }) {
     });
 
     const restoredSettings = JSON.parse(fs.readFileSync(claudeSettingsPath, 'utf8'));
-    assert(isDeepStrictEqual(restoredSettings, originalSettings), 'Claude local restore should restore the full original settings object');
     assert(restoredSettings.env?.ANTHROPIC_AUTH_TOKEN === 'local-auth-token', 'Claude local restore should bring back original auth token');
     assert(restoredSettings.env?.ANTHROPIC_BASE_URL === 'https://local.anthropic.test', 'Claude local restore should bring back original base URL');
     assert(restoredSettings.env?.ANTHROPIC_MODEL === 'claude-local-model', 'Claude local restore should bring back original model');
     assert(restoredSettings.env?.ANTHROPIC_DEFAULT_SONNET_MODEL === 'claude-local-sonnet', 'Claude local restore should bring back original sonnet model');
-    assert(restoredSettings.model === 'sonnet[1m]', 'Claude local restore should bring back original top-level model');
+    assert(restoredSettings.model === 'custom-temp-model', 'Claude local restore should preserve user changes made outside managed env keys');
     assert(!restoredSettings.env?.ANTHROPIC_API_KEY, 'Claude local restore should remove managed API key');
     assert(restoredSettings.env?.PRESERVE_ME === 'still-here', 'Claude local restore should keep unrelated env keys');
-    assert(restoredSettings.permissions?.allow?.[0] === 'Read(/tmp)', 'Claude local restore should keep unrelated top-level settings');
+    assert(Array.isArray(restoredSettings.permissions?.allow) && restoredSettings.permissions.allow.includes('Write(/tmp/generated)'), 'Claude local restore should preserve concurrent top-level edits');
+    assert(restoredSettings.someUnifiedOnlyField === true, 'Claude local restore should preserve concurrent fields outside managed env keys');
     assert(!fs.existsSync(backupPath), 'Claude local restore should clear consumed backup file');
     const claudeSpawnLines = findProcessLogLines(logsDir, claudeRuntimeSession.sessionId, 'process_spawn');
     const latestClaudeSpawn = claudeSpawnLines[claudeSpawnLines.length - 1] || '';

@@ -1530,19 +1530,29 @@ function restoreManagedClaudeSettings(previousTemplate = null, options = {}) {
   const settings = readClaudeSettings();
   const cleanedEnv = stripManagedClaudeSettingsEnv(settings.env);
 
-  if (backup) {
-    if (backup.settings && backup.exists !== false) {
-      writeClaudeSettings(backup.settings);
-      clearClaudeSettingsBackup();
-      return true;
-    }
-    if (backup.exists === false) {
-      deleteClaudeSettingsFile();
-      clearClaudeSettingsBackup();
-      return true;
-    }
+  const writeMergedClaudeSettings = (nextSettings) => {
+    const normalized = nextSettings && typeof nextSettings === 'object'
+      ? cloneJson(nextSettings)
+      : {};
+    const env = normalized?.env && typeof normalized.env === 'object'
+      ? Object.fromEntries(Object.entries(normalized.env).filter(([, value]) => value !== undefined && value !== null && String(value).trim()))
+      : null;
+    if (env && Object.keys(env).length > 0) normalized.env = env;
+    else delete normalized.env;
+    if (Object.keys(normalized).length > 0) writeClaudeSettings(normalized);
+    else deleteClaudeSettingsFile();
+  };
 
-    return false;
+  if (backup) {
+    const previousManagedEnv = extractManagedClaudeSettingsEnv(backup.settings?.env || {});
+    const nextSettings = settings && typeof settings === 'object' ? cloneJson(settings) : {};
+    nextSettings.env = {
+      ...cleanedEnv,
+      ...previousManagedEnv,
+    };
+    writeMergedClaudeSettings(nextSettings);
+    clearClaudeSettingsBackup();
+    return true;
   }
 
   const currentManagedEnv = extractManagedClaudeSettingsEnv(settings.env);
@@ -1555,7 +1565,7 @@ function restoreManagedClaudeSettings(previousTemplate = null, options = {}) {
   if (!shouldClear) return false;
 
   settings.env = cleanedEnv;
-  writeClaudeSettings(settings);
+  writeMergedClaudeSettings(settings);
   return true;
 }
 

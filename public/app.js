@@ -197,7 +197,7 @@
   const modeSelect = $('#mode-select');
 
   function getRememberedPassword() {
-    return String(localStorage.getItem(REMEMBERED_PASSWORD_STORAGE_KEY) || '');
+    return String(sessionStorage.getItem(REMEMBERED_PASSWORD_STORAGE_KEY) || '');
   }
 
   function hasRememberedPassword() {
@@ -206,12 +206,12 @@
 
   function saveRememberedPassword(password) {
     const value = String(password || '');
-    if (value) localStorage.setItem(REMEMBERED_PASSWORD_STORAGE_KEY, value);
-    else localStorage.removeItem(REMEMBERED_PASSWORD_STORAGE_KEY);
+    if (value) sessionStorage.setItem(REMEMBERED_PASSWORD_STORAGE_KEY, value);
+    else sessionStorage.removeItem(REMEMBERED_PASSWORD_STORAGE_KEY);
   }
 
   function clearRememberedPassword() {
-    localStorage.removeItem(REMEMBERED_PASSWORD_STORAGE_KEY);
+    sessionStorage.removeItem(REMEMBERED_PASSWORD_STORAGE_KEY);
   }
 
   function restoreRememberedPasswordInput() {
@@ -5881,8 +5881,9 @@
     });
   }
 
-  // Clear the removed legacy key from older builds, but keep the new remember-password entry.
+  // Clear password remnants from older builds; remembered passwords are session-only now.
   localStorage.removeItem('webcoding-pw');
+  localStorage.removeItem(REMEMBERED_PASSWORD_STORAGE_KEY);
   restoreRememberedPasswordInput();
 
   // Visibility change: re-sync state when user returns to tab (critical for mobile)
