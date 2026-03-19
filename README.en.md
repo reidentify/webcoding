@@ -277,10 +277,16 @@ node server.js
 
 ## Release Notes
 
+- **v1.3.2**
+  - Expanded the unified API runtime so Claude and Codex can switch across local/custom channels with safer native resume behavior.
+  - Added structured carryover when a thread must be rebuilt, preserving recent context, paths, models, and key constraints.
+  - Backed up and restored `~/.claude/settings.json` when entering or leaving unified API mode.
+  - Added cache-busting query versions for `app.js` and `style.css`, plus broader regression coverage for bridge/runtime edge cases.
+
 - **v1.3.0**
   - Added a macOS LaunchAgent template at `deploy/macos/com.webcoding.server.plist`.
   - Renamed the LaunchAgent label to `com.webcoding.server` so it matches the project name.
-  - Renamed the npm package metadata from `cc-web` to `webcoding`, so startup logs no longer show `cc-web@1.2.8 start`.
+  - Renamed the npm package metadata to `webcoding`, so startup logs now show `webcoding@1.3.0 start`.
 
 - **v1.2.8**
   - **Dual-agent (Codex)**: create Claude or Codex sessions on the same backend; agent-isolated sidebar, settings, and import

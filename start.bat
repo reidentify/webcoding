@@ -15,6 +15,6 @@ if not exist node_modules (
     npm install
 )
 
-echo Starting CC-Web...
+echo Starting webcoding...
 node server.js
 pause

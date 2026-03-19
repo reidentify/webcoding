@@ -32,7 +32,7 @@ function sleep(ms) {
   })();
   const input = (await readStdin()).trim();
   const imageCount = args.filter((arg) => arg === '--image').length;
-  const statePath = path.join(os.tmpdir(), `cc-web-mock-codex-${threadId}.json`);
+  const statePath = path.join(os.tmpdir(), `webcoding-mock-codex-${threadId}.json`);
   let state = {};
   try {
     state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
@@ -82,6 +82,17 @@ function sleep(ms) {
   if (input === 'trigger codex auth error') {
     process.stderr.write('authentication failed: invalid api key\n');
     process.exit(1);
+  }
+
+  if (input === 'trigger codex metadata warning') {
+    process.stdout.write(`${JSON.stringify({
+      type: 'item.completed',
+      item: {
+        id: 'item_warn',
+        type: 'error',
+        message: 'Model metadata for `claude-sonnet-4-6` not found. Defaulting to fallback metadata; this can degrade performance and cause issues.',
+      },
+    })}\n`);
   }
 
   const slowStreamMatch = input.match(/^trigger codex slow stream(?:\s+(.+))?$/i);

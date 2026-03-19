@@ -12,6 +12,7 @@ config/model.json
 config/codex.json
 config/bridge-runtime.json
 config/bridge-state.json
+config/claude-settings-backup.json
 config/projects.json
 config/codex-runtime-home/
 CODE_REVIEW_REPORT.md

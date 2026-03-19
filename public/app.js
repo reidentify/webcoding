@@ -1,18 +1,18 @@
-// === CC-Web Frontend ===
+// === webcoding Frontend ===
 (function () {
   'use strict';
-  window.addEventListener('error', (e) => { console.error('[CC-INIT-ERROR]', e.message, e.filename, e.lineno); });
+  window.addEventListener('error', (e) => { console.error('[WEBCODING-INIT-ERROR]', e.message, e.filename, e.lineno); });
 
   const WS_URL = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
   const RENDER_DEBOUNCE = 100;
 
   // Claude Code model entries — matches real /model output
   const CLAUDE_MODEL_ENTRIES = [
-    { alias: 'default', value: 'default', label: 'Default (recommended)', desc: 'Use the default model (currently Sonnet 4.6)', pricing: '$3/$15 per Mtok' },
-    { alias: 'sonnet[1m]', value: 'sonnet[1m]', label: 'Sonnet (1M context)', desc: 'Sonnet 4.6 for long sessions', pricing: '$3/$15 per Mtok' },
-    { alias: 'opus', value: 'opus', label: 'Opus', desc: 'Opus 4.6 \u00b7 Most capable for complex work', pricing: '$5/$25 per Mtok' },
-    { alias: 'opus[1m]', value: 'opus[1m]', label: 'Opus (1M context)', desc: 'Opus 4.6 with 1M context [NEW] \u00b7 Most capable for complex work', pricing: '$5/$25 per Mtok' },
-    { alias: 'haiku', value: 'haiku', label: 'Haiku', desc: 'Haiku 4.5 \u00b7 Fastest for quick answers', pricing: '$1/$5 per Mtok' },
+    { alias: 'default', value: 'default', label: '默认（推荐）', desc: '使用默认模型（当前为 Sonnet 4.6）', pricing: '输入/输出 $3 / $15 / 百万 Token' },
+    { alias: 'sonnet[1m]', value: 'sonnet[1m]', label: 'Sonnet（1M 上下文）', desc: 'Sonnet 4.6，适合长上下文会话', pricing: '输入/输出 $3 / $15 / 百万 Token' },
+    { alias: 'opus', value: 'opus', label: 'Opus', desc: 'Opus 4.6，复杂任务能力最强', pricing: '输入/输出 $5 / $25 / 百万 Token' },
+    { alias: 'opus[1m]', value: 'opus[1m]', label: 'Opus（1M 上下文）', desc: 'Opus 4.6，支持 1M 上下文，适合复杂任务', pricing: '输入/输出 $5 / $25 / 百万 Token' },
+    { alias: 'haiku', value: 'haiku', label: 'Haiku', desc: 'Haiku 4.5，响应最快，适合快速问答', pricing: '输入/输出 $1 / $5 / 百万 Token' },
   ];
 
   const SLASH_COMMANDS = [
@@ -40,7 +40,7 @@
   const SESSION_CACHE_MAX_WEIGHT = 1_500_000;
   const SIDEBAR_SWIPE_TRIGGER = 72;
   const SIDEBAR_SWIPE_MAX_VERTICAL_DRIFT = 42;
-  const SIDEBAR_WIDTH_STORAGE_KEY = 'cc-web-sidebar-width';
+  const SIDEBAR_WIDTH_STORAGE_KEY = 'webcoding-sidebar-width';
   const SIDEBAR_DEFAULT_WIDTH = 320;
   const SIDEBAR_MIN_WIDTH = 280;
   const SIDEBAR_MAX_WIDTH = 560;
@@ -49,6 +49,7 @@
   const SESSION_LIST_COLLATOR = new Intl.Collator('zh-CN', { numeric: true, sensitivity: 'base' });
   const INPUT_MAX_HEIGHT_FALLBACK = 200;
   const RECONNECT_MAX_ATTEMPTS = 8;
+  const REMEMBERED_PASSWORD_STORAGE_KEY = 'webcoding-remembered-password';
 
   const MODE_PICKER_OPTIONS = [
     { value: 'yolo', label: 'YOLO', desc: '跳过所有权限检查' },
@@ -60,7 +61,9 @@
   // --- State ---
   let ws = null;
   const TOOL_GROUP_THRESHOLD = 2;
-  let authToken = localStorage.getItem('cc-web-token');
+  let authToken = localStorage.getItem('webcoding-token');
+  let pendingAuthPassword = null;
+  let pendingPasswordChangeValue = null;
   let currentSessionId = null;
   let sessions = [];
   let sessionCache = new Map();
@@ -74,7 +77,9 @@
   let cmdMenuDelegated = false;
   let currentMode = 'yolo';
   let currentModel = '';
-  const savedAgent = localStorage.getItem('cc-web-agent');
+  let currentActiveRuntime = null;
+  let currentRuntimeCount = 0;
+  const savedAgent = localStorage.getItem('webcoding-agent');
   let selectedAgent = AGENT_LABELS[savedAgent] ? savedAgent : DEFAULT_AGENT;
   let currentAgent = selectedAgent;
   let modelConfigCache = null;
@@ -86,7 +91,7 @@
   let uploadingAttachments = [];
   let currentCwd = null;
   let currentSessionRunning = false;
-  let skipDeleteConfirm = localStorage.getItem('cc-web-skip-delete-confirm') === '1';
+  let skipDeleteConfirm = localStorage.getItem('webcoding-skip-delete-confirm') === '1';
   let pendingInitialSessionLoad = false;
   let projects = [];
   let collapsedProjects = new Set();
@@ -122,6 +127,10 @@
     set currentMode(value) { currentMode = value; },
     get currentModel() { return currentModel; },
     set currentModel(value) { currentModel = value; },
+    get currentActiveRuntime() { return currentActiveRuntime; },
+    set currentActiveRuntime(value) { currentActiveRuntime = value; },
+    get currentRuntimeCount() { return currentRuntimeCount; },
+    set currentRuntimeCount(value) { currentRuntimeCount = value; },
     get sessions() { return sessions; },
     set sessions(value) { sessions = value; },
     get sessionCache() { return sessionCache; },
@@ -187,9 +196,34 @@
   const cmdMenu = $('#cmd-menu');
   const modeSelect = $('#mode-select');
 
+  function getRememberedPassword() {
+    return String(localStorage.getItem(REMEMBERED_PASSWORD_STORAGE_KEY) || '');
+  }
+
+  function hasRememberedPassword() {
+    return !!getRememberedPassword();
+  }
+
+  function saveRememberedPassword(password) {
+    const value = String(password || '');
+    if (value) localStorage.setItem(REMEMBERED_PASSWORD_STORAGE_KEY, value);
+    else localStorage.removeItem(REMEMBERED_PASSWORD_STORAGE_KEY);
+  }
+
+  function clearRememberedPassword() {
+    localStorage.removeItem(REMEMBERED_PASSWORD_STORAGE_KEY);
+  }
+
+  function restoreRememberedPasswordInput() {
+    const rememberedPassword = getRememberedPassword();
+    if (rememberPw) rememberPw.checked = !!rememberedPassword;
+    if (!loginPassword) return;
+    loginPassword.value = rememberedPassword;
+  }
+
   function parseStoredCollapsedProjects() {
     try {
-      const raw = localStorage.getItem('cc-web-collapsed-projects') || '[]';
+      const raw = localStorage.getItem('webcoding-collapsed-projects') || '[]';
       const parsed = JSON.parse(raw);
       return Array.isArray(parsed) ? parsed : [];
     } catch {
@@ -339,7 +373,9 @@
     const currentMessageCount = getCurrentMessageCount();
     const usageText = costDisplay?.textContent || (sessionState.currentAgent === 'codex' ? '暂无 token 统计' : '暂无费用统计');
     const modeLabel = MODE_LABELS[sessionState.currentMode] || sessionState.currentMode;
-    const modelLabel = sessionState.currentModel || (sessionState.currentAgent === 'codex' ? '会话内决定' : 'Default');
+    const modelLabel = sessionState.currentModel || (sessionState.currentAgent === 'codex' ? '默认模型' : 'Default');
+    const channelLabel = sessionState.currentActiveRuntime?.channelLabel || '当前渠道未建立';
+    const runtimeCountLabel = sessionState.currentRuntimeCount > 0 ? `${sessionState.currentRuntimeCount} 个` : '0 个';
     const selectedAgentLabel = AGENT_LABELS[selectedAgent] || selectedAgent;
     const currentAgentLabel = AGENT_LABELS[sessionState.currentAgent] || sessionState.currentAgent;
     const runtimeLabel = sessionState.currentSessionRunning ? '运行中' : currentMeta ? '待命中' : '未开始';
@@ -382,8 +418,10 @@
           </div>
           <div class="insights-detail-list">
             <div class="insights-detail-item"><span>当前代理</span><strong>${escapeHtml(currentAgentLabel)}</strong></div>
+            <div class="insights-detail-item"><span>当前渠道</span><strong>${escapeHtml(channelLabel)}</strong></div>
             <div class="insights-detail-item"><span>模型</span><strong>${escapeHtml(modelLabel)}</strong></div>
             <div class="insights-detail-item"><span>模式</span><strong>${escapeHtml(modeLabel)}</strong></div>
+            <div class="insights-detail-item"><span>子线程</span><strong>${escapeHtml(runtimeCountLabel)}</strong></div>
             <div class="insights-detail-item"><span>消息数</span><strong>${currentMessageCount > 0 ? `${currentMessageCount} 条` : '暂无'}</strong></div>
             <div class="insights-detail-item"><span>最近更新</span><strong>${escapeHtml(currentMeta?.updated ? timeAgo(currentMeta.updated) : '尚未开始')}</strong></div>
           </div>
@@ -463,11 +501,11 @@
   }
 
   function getAgentSessionStorageKey(agent) {
-    return `cc-web-session-${normalizeAgent(agent)}`;
+    return `webcoding-session-${normalizeAgent(agent)}`;
   }
 
   function getAgentModeStorageKey(agent) {
-    return `cc-web-mode-${normalizeAgent(agent)}`;
+    return `webcoding-mode-${normalizeAgent(agent)}`;
   }
 
   function getLastSessionForAgent(agent) {
@@ -476,7 +514,7 @@
 
   function setLastSessionForAgent(agent, sessionId) {
     localStorage.setItem(getAgentSessionStorageKey(agent), sessionId);
-    localStorage.setItem('cc-web-session', sessionId);
+    localStorage.setItem('webcoding-session', sessionId);
   }
 
   function getSessionMeta(sessionId) {
@@ -514,7 +552,7 @@
       try {
         listener.fn(payload);
       } catch (error) {
-        console.error('[CC-WS-EVENT]', type, error);
+        console.error('[WEBCODING-WS-EVENT]', type, error);
       }
       if (listener.once) {
         bucket.delete(listener);
@@ -580,19 +618,46 @@
       mode: snapshot.mode || '',
       model: snapshot.model || '',
       agent: snapshot.agent || '',
+      activeRuntime: snapshot.activeRuntime || null,
+      runtimeCount: snapshot.runtimeCount || 0,
       cwd: snapshot.cwd || '',
       updated: snapshot.updated || '',
     }).length;
     return base + (snapshot.messages || []).reduce((sum, message) => sum + estimateSessionMessageWeight(message), 0);
   }
 
+  function normalizeActiveRuntime(runtime, fallbackAgent, fallbackModel = '') {
+    if (!runtime || typeof runtime !== 'object') return null;
+    const agent = normalizeAgent(runtime.agent || fallbackAgent);
+    return {
+      agent,
+      channelKey: runtime.channelKey || null,
+      channelLabel: runtime.channelLabel || null,
+      mode: runtime.mode || null,
+      model: runtime.model || '',
+      displayModel: runtime.displayModel || runtime.model || fallbackModel || '',
+      explicitModel: runtime.explicitModel || '',
+      defaultModel: runtime.defaultModel || '',
+      runtimeIdPresent: !!runtime.runtimeIdPresent,
+      runtimeId: runtime.runtimeId || null,
+      runtimeCount: Number.isFinite(runtime.runtimeCount) ? runtime.runtimeCount : 0,
+    };
+  }
+
   function normalizeSessionSnapshot(payload, options = {}) {
+    const normalizedRuntime = normalizeActiveRuntime(payload.activeRuntime, payload.agent, payload.model || '');
+    const hasPayloadModel = Object.prototype.hasOwnProperty.call(payload || {}, 'model');
     return {
       sessionId: payload.sessionId,
       messages: cloneMessages(payload.messages || []),
       title: payload.title || '新会话',
       mode: payload.mode || 'yolo',
-      model: payload.model || '',
+      model: hasPayloadModel ? (payload.model || '') : (normalizedRuntime?.displayModel || ''),
+      activeRuntime: normalizedRuntime,
+      activeChannelKey: payload.activeChannelKey || normalizedRuntime?.channelKey || null,
+      runtimeCount: Number.isFinite(payload.runtimeCount)
+        ? payload.runtimeCount
+        : (normalizedRuntime?.runtimeCount || 0),
       agent: normalizeAgent(payload.agent),
       hasUnread: !!payload.hasUnread,
       cwd: payload.cwd || null,
@@ -800,8 +865,8 @@
 
       const cleanup = () => {
         clearTimeout(timeout);
-        document.removeEventListener('cc-web-auth-restored', onRestored);
-        document.removeEventListener('cc-web-auth-failed', onFailed);
+        document.removeEventListener('webcoding-auth-restored', onRestored);
+        document.removeEventListener('webcoding-auth-failed', onFailed);
       };
       const onRestored = () => {
         cleanup();
@@ -811,8 +876,8 @@
         cleanup();
         reject(new Error('登录状态已失效，请刷新页面后重新登录再上传图片。'));
       };
-      document.addEventListener('cc-web-auth-restored', onRestored);
-      document.addEventListener('cc-web-auth-failed', onFailed);
+      document.addEventListener('webcoding-auth-restored', onRestored);
+      document.addEventListener('webcoding-auth-failed', onFailed);
 
       if (!connectionState.ws || connectionState.ws.readyState > WebSocket.OPEN) {
         connect();
@@ -1010,7 +1075,7 @@
 
   function setSelectedAgent(agent, options = {}) {
     selectedAgent = normalizeAgent(agent);
-    localStorage.setItem('cc-web-agent', selectedAgent);
+    localStorage.setItem('webcoding-agent', selectedAgent);
     if (options.syncMode) {
       sessionState.currentMode = getSavedModeForAgent(selectedAgent);
       modeSelect.value = sessionState.currentMode;
@@ -1042,7 +1107,7 @@
     setSelectedAgent(targetAgent, { syncMode: true });
     renderSessionList();
 
-    const lastOpenedId = localStorage.getItem('cc-web-session');
+    const lastOpenedId = localStorage.getItem('webcoding-session');
     const lastOpenedMeta = lastOpenedId ? getSessionMeta(lastOpenedId) : null;
     if (lastOpenedMeta) {
       openSession(lastOpenedId);
@@ -1068,6 +1133,8 @@
     setCurrentSessionRunningState(false);
     sessionState.currentCwd = null;
     sessionState.currentModel = '';
+    sessionState.currentActiveRuntime = null;
+    sessionState.currentRuntimeCount = 0;
     composeState.isGenerating = false;
     composeState.pendingText = '';
     composeState.pendingAttachments = [];
@@ -1115,6 +1182,8 @@
     }
     updateAgentScopedUI();
     sessionState.currentModel = snapshot.model || '';
+    sessionState.currentActiveRuntime = snapshot.activeRuntime ? deepClone(snapshot.activeRuntime) : null;
+    sessionState.currentRuntimeCount = Number.isFinite(snapshot.runtimeCount) ? snapshot.runtimeCount : 0;
     if (!preserveStreaming) {
       renderMessages(snapshot.messages || [], { immediate: !!options.immediate });
     }
@@ -1250,7 +1319,7 @@
       options.push({ value: v, label: label || v, desc: desc || 'Codex 模型' });
     }
 
-    addOption('default', 'Default', '使用当前 Codex 默认模型');
+    addOption('default', '默认模型', '使用当前默认模型');
     addOption(sessionState.currentModel, sessionState.currentModel, '当前会话模型');
     sessionState.sessions
       .filter((s) => normalizeAgent(s.agent) === 'codex')
@@ -1461,9 +1530,14 @@
   // --- Server Message Handler ---
   function handleAuthResultMessage(msg) {
     if (msg.success) {
+      if (pendingAuthPassword !== null) {
+        if (rememberPw?.checked) saveRememberedPassword(pendingAuthPassword);
+        else clearRememberedPassword();
+        pendingAuthPassword = null;
+      }
       connectionState.authToken = msg.token;
-      localStorage.setItem('cc-web-token', msg.token);
-      document.dispatchEvent(new CustomEvent('cc-web-auth-restored'));
+      localStorage.setItem('webcoding-token', msg.token);
+      document.dispatchEvent(new CustomEvent('webcoding-auth-restored'));
       loginOverlay.hidden = true;
       app.hidden = false;
       send({ type: 'get_codex_config' });
@@ -1475,11 +1549,14 @@
       }
       return;
     }
+    const attemptedPassword = pendingAuthPassword;
+    pendingAuthPassword = null;
     connectionState.authToken = null;
-    localStorage.removeItem('cc-web-token');
-    document.dispatchEvent(new CustomEvent('cc-web-auth-failed'));
+    localStorage.removeItem('webcoding-token');
+    document.dispatchEvent(new CustomEvent('webcoding-auth-failed'));
     loginOverlay.hidden = false;
     app.hidden = true;
+    if (attemptedPassword === null) restoreRememberedPasswordInput();
     loginError.hidden = false;
   }
 
@@ -1615,9 +1692,21 @@
 
   function handleModelChangedMessage(msg) {
     if (msg.model === undefined) return;
+    const normalizedRuntime = normalizeActiveRuntime(msg.activeRuntime, sessionState.currentAgent, msg.model || '');
     sessionState.currentModel = msg.model || '';
+    sessionState.currentActiveRuntime = normalizedRuntime;
+    sessionState.currentRuntimeCount = Number.isFinite(msg.runtimeCount)
+      ? msg.runtimeCount
+      : (normalizedRuntime?.runtimeCount || 0);
     if (sessionState.currentSessionId) {
-      updateCachedSession(sessionState.currentSessionId, (snapshot) => { snapshot.model = msg.model; });
+      updateCachedSession(sessionState.currentSessionId, (snapshot) => {
+        snapshot.model = msg.model || '';
+        snapshot.activeRuntime = normalizedRuntime ? deepClone(normalizedRuntime) : null;
+        snapshot.activeChannelKey = msg.activeChannelKey || normalizedRuntime?.channelKey || null;
+        snapshot.runtimeCount = Number.isFinite(msg.runtimeCount)
+          ? msg.runtimeCount
+          : (normalizedRuntime?.runtimeCount || 0);
+      });
     }
     renderWorkspaceInsights();
   }
@@ -2568,7 +2657,7 @@
     box.querySelector('#del-confirm-ok').addEventListener('click', () => { close(); onConfirm(); });
     box.querySelector('#del-confirm-skip').addEventListener('click', () => {
       skipDeleteConfirm = true;
-      localStorage.setItem('cc-web-skip-delete-confirm', '1');
+      localStorage.setItem('webcoding-skip-delete-confirm', '1');
       close();
       onConfirm();
     });
@@ -2891,7 +2980,7 @@
           if (getLastSessionForAgent(sessionAgent) === s.id) {
             localStorage.removeItem(getAgentSessionStorageKey(sessionAgent));
           }
-          if (localStorage.getItem('cc-web-session') === s.id) localStorage.removeItem('cc-web-session');
+          if (localStorage.getItem('webcoding-session') === s.id) localStorage.removeItem('webcoding-session');
           invalidateSessionCache(s.id);
           send({ type: 'delete_session', sessionId: s.id });
           if (s.id === sessionState.currentSessionId) {
@@ -2924,7 +3013,7 @@
   }
 
   function saveCollapsedProjects() {
-    localStorage.setItem('cc-web-collapsed-projects', JSON.stringify([...collapsedProjects]));
+    localStorage.setItem('webcoding-collapsed-projects', JSON.stringify([...collapsedProjects]));
   }
 
   function renderProjectGroup(project, groupSessions, container, timestampCache) {
@@ -3479,19 +3568,26 @@
 
     picker.innerHTML = `
       <div class="option-picker-title">${escapeHtml(title)}</div>
-      ${options.map(opt => `
-        <div class="option-picker-item${opt.value === currentValue ? ' active' : ''}" data-value="${opt.value}">
-          <div class="option-picker-item-info">
-            <div class="option-picker-item-label">${escapeHtml(opt.label)}</div>
-            <div class="option-picker-item-desc">${escapeHtml(opt.desc)}</div>
+      <div class="option-picker-list">
+        ${options.map(opt => `
+          <div class="option-picker-item${opt.value === currentValue ? ' active' : ''}" data-value="${opt.value}">
+            <div class="option-picker-item-info">
+              <div class="option-picker-item-label">${escapeHtml(opt.label)}</div>
+              <div class="option-picker-item-desc">${escapeHtml(opt.desc)}</div>
+            </div>
+            ${opt.value === currentValue ? '<span class="option-picker-item-check">✓</span>' : ''}
           </div>
-          ${opt.value === currentValue ? '<span class="option-picker-item-check">✓</span>' : ''}
-        </div>
-      `).join('')}
+        `).join('')}
+      </div>
     `;
 
     const chatMain = document.querySelector('.chat-main');
     chatMain.appendChild(picker);
+
+    const activeItem = picker.querySelector('.option-picker-item.active');
+    if (activeItem) {
+      requestAnimationFrame(() => activeItem.scrollIntoView({ block: 'nearest' }));
+    }
 
     picker.querySelectorAll('.option-picker-item').forEach(el => {
       el.addEventListener('click', () => {
@@ -3597,19 +3693,24 @@
 
     picker.innerHTML = `
       <div class="mp-header">
-        <div class="option-picker-title">Select model</div>
-        <div class="mp-subtitle">Switch between Claude models. Applies to this session.<br>For other/previous model names, specify with --model.</div>
+        <div class="option-picker-title">选择模型</div>
+        <div class="mp-subtitle">切换当前会话使用的 Claude 模型。<br>如果要指定其他或旧版模型名，请使用 <code>--model</code>。</div>
       </div>
       <div class="mp-items">${itemsHtml}</div>
       <div class="mp-custom">
-        <input type="text" id="model-custom-input" placeholder="Enter custom model ID (e.g. claude-sonnet-4-6)"
-          style="width:100%;box-sizing:border-box;padding:6px 10px;border:1px solid var(--border-color,#ccc);border-radius:4px;font-size:12px;font-family:var(--font-mono);background:var(--input-bg,#fff);color:var(--text-primary,#333);outline:none">
+        <input type="text" id="model-custom-input" class="mp-custom-input" placeholder="输入自定义模型 ID，例如 claude-sonnet-4-6">
       </div>
-      <div class="mp-hint">Enter to confirm \u00b7 Esc to exit</div>
+      <div class="mp-hint">回车确认 \u00b7 Esc 关闭</div>
     `;
 
     const chatMain = document.querySelector('.chat-main');
     chatMain.appendChild(picker);
+    const itemsContainer = picker.querySelector('.mp-items');
+
+    function scrollFocusedItemIntoView() {
+      const activeEl = picker.querySelector(`.option-picker-item[data-index="${focusIdx}"]`);
+      if (activeEl) activeEl.scrollIntoView({ block: 'nearest' });
+    }
 
     // Update focus indicators without full re-render
     function updateFocus(newIdx) {
@@ -3619,6 +3720,7 @@
         const cur = el.querySelector('.mp-cursor');
         if (cur) cur.textContent = i === focusIdx ? '\u276f' : '\u2003';
       });
+      if (itemsContainer) scrollFocusedItemIntoView();
     }
 
     // Click & hover on items
@@ -3669,6 +3771,10 @@
 
     document.addEventListener('keydown', handleKeyDown);
     picker._keyHandler = handleKeyDown;
+
+    requestAnimationFrame(() => {
+      if (itemsContainer) scrollFocusedItemIntoView();
+    });
 
     setTimeout(() => {
       document.addEventListener('click', _pickerOutsideClick);
@@ -3750,11 +3856,17 @@
     e.preventDefault();
     const pw = loginPassword.value;
     if (!pw) return;
+    pendingAuthPassword = pw;
     loginError.hidden = true;
     send({ type: 'auth', password: pw });
     // Request notification permission on first user interaction
     requestNotificationPermission();
   });
+  if (rememberPw) {
+    rememberPw.addEventListener('change', () => {
+      if (!rememberPw.checked) clearRememberedPassword();
+    });
+  }
 
   menuBtn.addEventListener('click', () => {
     sidebar.classList.contains('open') ? closeSidebar() : openSidebar();
@@ -4020,7 +4132,7 @@
       navigator.serviceWorker.ready.then((reg) => {
         reg.showNotification('Webcoding', {
           body: `「${title}」任务完成`,
-          tag: 'cc-web-task',
+          tag: 'webcoding-task',
           renotify: true,
         });
       }).catch((error) => {
@@ -4072,31 +4184,22 @@
         <button class="settings-close" title="关闭">&times;</button>
       </h3>
 
-      <div class="settings-section-title">代理运行方式</div>
+      <div class="settings-section-title">代理渠道</div>
       <div class="settings-field">
-        <label>Claude 接入方式</label>
-        <select class="settings-select" id="unified-claude-mode">
-          <option value="local">读取本地 Claude 配置</option>
-          <option value="custom">使用统一 API 配置</option>
-        </select>
+        <label>Claude 渠道</label>
+        <select class="settings-select" id="unified-claude-mode"></select>
       </div>
       <div class="settings-field">
-        <label>Codex 接入方式</label>
-        <select class="settings-select" id="unified-codex-mode">
-          <option value="local">读取本机 Codex 登录态 / ~/.codex/config.toml</option>
-          <option value="unified">使用统一 API 配置</option>
-        </select>
-      </div>
-      <div class="settings-inline-note">
-        这里不再区分“复用 Claude 配置”或“独立 Codex 配置”。Claude 和 Codex 需要走远程接口时，都直接使用下方同一套统一 API 配置。
+        <label>Codex 渠道</label>
+        <select class="settings-select" id="unified-codex-mode"></select>
       </div>
 
       <div class="settings-divider"></div>
 
-      <div class="settings-section-title">统一 API 配置</div>
+      <div class="settings-section-title">AI 提供商</div>
       <div id="unified-template-area"></div>
       <div class="settings-actions">
-        <button class="btn-save" id="unified-save-btn">保存统一配置</button>
+        <button class="btn-save" id="unified-save-btn">保存渠道配置</button>
       </div>
       <div class="settings-status" id="unified-status"></div>
 
@@ -4130,11 +4233,11 @@
   function buildUnifiedTemplateModalHtml(current, draft) {
     return `
       <div class="settings-header">
-        <h3>${current ? `编辑配置: ${escapeHtml(current.name)}` : '新建统一 API 配置'}</h3>
+        <h3>${current ? `编辑提供商: ${escapeHtml(current.name)}` : '新建 AI 提供商'}</h3>
         <button class="settings-close" id="unified-template-modal-close">&times;</button>
       </div>
       <div class="settings-field">
-        <label>配置名称</label>
+        <label>提供商名称</label>
         <input type="text" id="unified-template-name" value="${escapeHtml(draft.name || '')}">
       </div>
       <div class="settings-field">
@@ -4183,7 +4286,7 @@
       </div>
       <datalist id="unified-template-models"></datalist>
       <div class="settings-inline-note">
-        这套配置会同时服务 Claude 与 Codex。Codex 主要使用 API Key、API Base URL 和默认模型；Claude 还会读取 Opus / Sonnet / Haiku 这三个模型映射。
+        这套 AI 提供商配置会出现在 Claude 和 Codex 的渠道下拉框里。Codex 主要使用 API Key、API Base URL 和“默认模型”；Claude 还会读取 Opus / Sonnet / Haiku 这三个模型映射。
       </div>
       <div class="settings-actions">
         <button class="btn-save" id="unified-template-ok">确定</button>
@@ -4246,7 +4349,9 @@
     let modelConfigLoaded = false;
     let codexConfigLoaded = false;
     let modelEditingTemplates = [];
-    let modelActiveTemplate = '';
+    let providerEditorSelection = '';
+    let selectedClaudeChannel = 'local';
+    let selectedCodexChannel = 'local';
     let _onUpdateInfo = null;
 
     function syncUnifiedControlsState() {
@@ -4263,14 +4368,18 @@
         ...template,
         originalName: template.originalName || template.name || '',
       }));
-      modelActiveTemplate = normalized.activeTemplate || (modelEditingTemplates[0]?.name || '');
-      claudeModeSelect.value = normalized.mode || 'local';
+      providerEditorSelection = normalized.activeTemplate || providerEditorSelection || (modelEditingTemplates[0]?.name || '');
+      selectedClaudeChannel = normalized.mode === 'custom'
+        ? (normalized.activeTemplate || modelEditingTemplates[0]?.name || 'local')
+        : 'local';
     }
 
     function applyCodexConfigToPanel(config, markLoaded = true) {
       if (markLoaded) codexConfigLoaded = true;
       currentCodexConfig = config || { mode: 'local', legacyMode: '' };
-      codexModeSelect.value = currentCodexConfig.mode || 'local';
+      selectedCodexChannel = currentCodexConfig.mode === 'unified'
+        ? (currentCodexConfig.sharedTemplate || modelEditingTemplates[0]?.name || 'local')
+        : 'local';
     }
 
     function showUnifiedStatus(msg, type) {
@@ -4291,44 +4400,77 @@
       return collectNotifyConfigFromPanel(panel, currentNotifyConfig, providerSelect.value);
     }
 
-    function ensureActiveTemplateSelection() {
-      if (!modelActiveTemplate && modelEditingTemplates.length) {
-        modelActiveTemplate = modelEditingTemplates[0].name;
+    function ensureChannelSelections() {
+      if (!modelEditingTemplates.length) {
+        providerEditorSelection = '';
+        selectedClaudeChannel = 'local';
+        selectedCodexChannel = 'local';
+        return;
       }
-      const active = modelEditingTemplates.find((template) => template.name === modelActiveTemplate) || null;
-      if (!active && modelEditingTemplates.length) {
-        modelActiveTemplate = modelEditingTemplates[0].name;
-        return modelEditingTemplates[0];
+
+      const names = new Set(modelEditingTemplates.map((template) => template.name));
+      if (!names.has(providerEditorSelection)) {
+        providerEditorSelection = modelEditingTemplates[0].name;
       }
-      return active;
+      if (selectedClaudeChannel !== 'local' && !names.has(selectedClaudeChannel)) {
+        selectedClaudeChannel = modelEditingTemplates[0].name;
+      }
+      if (selectedCodexChannel !== 'local' && !names.has(selectedCodexChannel)) {
+        selectedCodexChannel = modelEditingTemplates[0].name;
+      }
+    }
+
+    function renderAgentChannelOptions() {
+      ensureChannelSelections();
+      const providerOptions = modelEditingTemplates.map((template) =>
+        `<option value="${escapeHtml(template.name)}">${escapeHtml(template.name)}</option>`
+      ).join('');
+      claudeModeSelect.innerHTML = `
+        <option value="local">读取本地 Claude 配置</option>
+        ${providerOptions}
+      `;
+      codexModeSelect.innerHTML = `
+        <option value="local">读取本机 Codex 登录态 / ~/.codex/config.toml</option>
+        ${providerOptions}
+      `;
+      claudeModeSelect.value = selectedClaudeChannel;
+      codexModeSelect.value = selectedCodexChannel;
+    }
+
+    function getChannelDisplayLabel(agent, channelValue) {
+      if (channelValue === 'local') {
+        return agent === 'codex' ? '本机登录态' : '本地配置';
+      }
+      return channelValue || '未选择';
     }
 
     function renderTemplateArea() {
       if (!modelConfigLoaded || !codexConfigLoaded) {
         templateArea.innerHTML = `
           <div class="settings-inline-note">
-            正在加载统一配置...
+            正在加载 AI 提供商配置...
           </div>
         `;
         return;
       }
 
-      const activeTemplate = ensureActiveTemplateSelection();
+      renderAgentChannelOptions();
+      const activeTemplate = modelEditingTemplates.find((template) => template.name === providerEditorSelection) || null;
       const legacyMode = currentCodexConfig?.legacyMode || '';
       const legacyNote = legacyMode === 'custom'
-        ? '检测到旧版 Codex 独立配置。当前页面不再维护那套分叉逻辑；你保存后，Codex 会切到统一 API 配置。'
+        ? '检测到旧版 Codex 独立配置。当前页面不再维护那套分叉逻辑；你保存后，Codex 会改为从上面的 AI 提供商列表里单独选渠道。'
         : (legacyMode === 'shared'
-          ? '检测到旧版“复用 Claude 配置”模式。当前页面已经改成统一 API 逻辑，保存后会按统一 API 配置运行。'
+          ? '检测到旧版“复用 Claude 配置”模式。当前页面已经改成独立渠道逻辑，保存后 Claude 和 Codex 可以分别选择不同的 AI 提供商。'
           : '');
 
       if (!modelEditingTemplates.length) {
         templateArea.innerHTML = `
           <div class="settings-inline-note">
-            统一 API 配置为空。只要 Claude 或 Codex 有一个需要走远程接口，就先在这里新建一套 API 配置。
+            AI 提供商列表为空。只要 Claude 或 Codex 有一个需要走远程接口，就先在这里新建至少一套提供商配置。
           </div>
           ${legacyNote ? `<div class="settings-inline-note warning">${legacyNote}</div>` : ''}
           <div class="settings-actions" style="margin-top:0">
-            <button class="btn-test" id="unified-template-add-first">+ 新建配置</button>
+            <button class="btn-test" id="unified-template-add-first">+ 新建提供商</button>
           </div>
         `;
         panel.querySelector('#unified-template-add-first').addEventListener('click', () => openUnifiedTemplateModal());
@@ -4336,35 +4478,20 @@
       }
 
       const options = modelEditingTemplates.map((template) =>
-        `<option value="${escapeHtml(template.name)}" ${template.name === modelActiveTemplate ? 'selected' : ''}>${escapeHtml(template.name)}</option>`
+        `<option value="${escapeHtml(template.name)}" ${template.name === providerEditorSelection ? 'selected' : ''}>${escapeHtml(template.name)}</option>`
       ).join('');
-      const upstreamLabel = activeTemplate?.upstreamType === 'anthropic' ? 'Anthropic / Messages' : 'OpenAI / Responses';
-      const summaryBase = activeTemplate?.apiBase ? escapeHtml(activeTemplate.apiBase) : '未设置 API Base URL';
-      const summaryModel = activeTemplate?.defaultModel ? escapeHtml(activeTemplate.defaultModel) : '未设置（Claude / Codex 将沿用各自工具默认模型）';
-      const claudeModeLabel = claudeModeSelect.value === 'custom' ? '统一 API' : '本地配置';
-      const codexModeLabel = codexModeSelect.value === 'unified' ? '统一 API' : '本机登录态';
-
       templateArea.innerHTML = `
-        <div class="settings-inline-note">
-          Claude 当前走：<strong>${claudeModeLabel}</strong>；Codex 当前走：<strong>${codexModeLabel}</strong>。当任一代理切到统一 API 时，都会使用这里的激活配置。
-        </div>
         ${legacyNote ? `<div class="settings-inline-note warning">${legacyNote}</div>` : ''}
         <div class="settings-field">
-          <label>激活配置</label>
+          <label>提供商列表</label>
           <div style="display:flex;gap:6px;align-items:center">
             <select class="settings-select" id="unified-template-select" style="flex:1">
               ${options}
-              <option value="__new__">+ 新建配置</option>
+              <option value="__new__">+ 新建提供商</option>
             </select>
             <button class="btn-test" id="unified-template-edit" style="padding:4px 10px">编辑</button>
             <button class="btn-test" id="unified-template-del" title="删除" style="padding:4px 8px">删除</button>
           </div>
-        </div>
-        <div class="settings-inline-note">
-          当前激活配置：<strong>${escapeHtml(activeTemplate?.name || '未选择')}</strong><br>
-          上游协议：<code>${escapeHtml(upstreamLabel)}</code><br>
-          API Base URL：<code>${summaryBase}</code><br>
-          默认模型：<code>${summaryModel}</code>
         </div>
       `;
 
@@ -4373,19 +4500,19 @@
           openUnifiedTemplateModal();
           return;
         }
-        modelActiveTemplate = e.target.value;
+        providerEditorSelection = e.target.value;
         renderTemplateArea();
       });
 
       panel.querySelector('#unified-template-edit').addEventListener('click', () => {
-        openUnifiedTemplateModal(modelActiveTemplate);
+        openUnifiedTemplateModal(providerEditorSelection);
       });
 
       panel.querySelector('#unified-template-del').addEventListener('click', () => {
-        if (!modelActiveTemplate) return;
-        if (!confirm(`确认删除配置「${modelActiveTemplate}」?`)) return;
-        modelEditingTemplates = modelEditingTemplates.filter((template) => template.name !== modelActiveTemplate);
-        modelActiveTemplate = modelEditingTemplates[0]?.name || '';
+        if (!providerEditorSelection) return;
+        if (!confirm(`确认删除提供商「${providerEditorSelection}」?`)) return;
+        modelEditingTemplates = modelEditingTemplates.filter((template) => template.name !== providerEditorSelection);
+        providerEditorSelection = modelEditingTemplates[0]?.name || '';
         renderTemplateArea();
       });
     }
@@ -4468,7 +4595,7 @@
         const haikuModel = modal.querySelector('#unified-template-haiku').value.trim();
 
         if (!name) {
-          alert('请填写配置名称');
+          alert('请填写提供商名称');
           return;
         }
         if (!apiKey) {
@@ -4482,11 +4609,12 @@
 
         const existing = modelEditingTemplates.find((template) => template.name === name);
         if (existing && existing !== current) {
-          alert('配置名称已存在');
+          alert('提供商名称已存在');
           return;
         }
 
         if (current) {
+          const previousName = current.name;
           if (!current.originalName) current.originalName = current.name;
           current.name = name;
           current.apiKey = apiKey;
@@ -4496,6 +4624,9 @@
           current.opusModel = opusModel;
           current.sonnetModel = sonnetModel;
           current.haikuModel = haikuModel;
+          if (providerEditorSelection === previousName) providerEditorSelection = name;
+          if (selectedClaudeChannel === previousName) selectedClaudeChannel = name;
+          if (selectedCodexChannel === previousName) selectedCodexChannel = name;
         } else {
           modelEditingTemplates.push({
             name,
@@ -4508,16 +4639,23 @@
             sonnetModel,
             haikuModel,
           });
+          if (!providerEditorSelection) providerEditorSelection = name;
         }
 
-        modelActiveTemplate = name;
+        providerEditorSelection = name;
         closeTemplateModal();
         renderTemplateArea();
       });
     }
 
-    claudeModeSelect.addEventListener('change', renderTemplateArea);
-    codexModeSelect.addEventListener('change', renderTemplateArea);
+    claudeModeSelect.addEventListener('change', () => {
+      selectedClaudeChannel = claudeModeSelect.value;
+      renderTemplateArea();
+    });
+    codexModeSelect.addEventListener('change', () => {
+      selectedCodexChannel = codexModeSelect.value;
+      renderTemplateArea();
+    });
     providerSelect.addEventListener('change', () => renderFields(providerSelect.value));
 
     unifiedSaveBtn.addEventListener('click', async () => {
@@ -4526,15 +4664,28 @@
         return;
       }
 
-      const needsUnifiedTemplate = claudeModeSelect.value === 'custom' || codexModeSelect.value === 'unified';
-      if (needsUnifiedTemplate && modelEditingTemplates.length === 0) {
-        showUnifiedStatus('至少需要一个统一 API 配置', 'error');
+      ensureChannelSelections();
+      const claudeUsesProvider = selectedClaudeChannel !== 'local';
+      const codexUsesProvider = selectedCodexChannel !== 'local';
+      const needsProvider = claudeUsesProvider || codexUsesProvider;
+      if (needsProvider && modelEditingTemplates.length === 0) {
+        showUnifiedStatus('至少需要一个 AI 提供商配置', 'error');
         return;
       }
 
-      const activeTemplate = ensureActiveTemplateSelection();
-      if (needsUnifiedTemplate && (!activeTemplate || !activeTemplate.apiKey || !activeTemplate.apiBase)) {
-        showUnifiedStatus('激活配置缺少 API Key 或 API Base URL', 'error');
+      const claudeTemplate = claudeUsesProvider
+        ? modelEditingTemplates.find((template) => template.name === selectedClaudeChannel) || null
+        : null;
+      const codexTemplate = codexUsesProvider
+        ? modelEditingTemplates.find((template) => template.name === selectedCodexChannel) || null
+        : null;
+
+      if (claudeUsesProvider && (!claudeTemplate || !claudeTemplate.apiKey || !claudeTemplate.apiBase)) {
+        showUnifiedStatus('Claude 选中的 AI 提供商缺少 API Key 或 API Base URL', 'error');
+        return;
+      }
+      if (codexUsesProvider && (!codexTemplate || !codexTemplate.apiKey || !codexTemplate.apiBase)) {
+        showUnifiedStatus('Codex 选中的 AI 提供商缺少 API Key 或 API Base URL', 'error');
         return;
       }
 
@@ -4544,17 +4695,17 @@
       send({
         type: 'save_model_config',
         config: {
-          mode: claudeModeSelect.value,
-          activeTemplate: modelActiveTemplate,
+          mode: claudeUsesProvider ? 'custom' : 'local',
+          activeTemplate: claudeUsesProvider ? selectedClaudeChannel : '',
           templates: modelEditingTemplates,
         },
       });
       send({
         type: 'save_codex_config',
         config: {
-          mode: codexModeSelect.value,
+          mode: codexUsesProvider ? 'unified' : 'local',
           legacyMode: '',
-          sharedTemplate: modelActiveTemplate || currentCodexConfig?.sharedTemplate || '',
+          sharedTemplate: codexUsesProvider ? selectedCodexChannel : '',
           enableSearch: false,
         },
       });
@@ -4887,6 +5038,7 @@
         status.className = 'settings-status error';
         submitBtn.disabled = false;
       }, 15000);
+      pendingPasswordChangeValue = newPw;
       send({ type: 'change_password', currentPassword: currentPw, newPassword: newPw });
     });
 
@@ -4980,6 +5132,7 @@
       submitBtn.disabled = true;
       statusEl.textContent = '正在修改...';
       statusEl.className = 'fc-status';
+      pendingPasswordChangeValue = newPw;
       send({ type: 'change_password', newPassword: newPw });
     });
 
@@ -5011,9 +5164,16 @@
 
   function handlePasswordChanged(msg) {
     if (msg.success) {
+      if (pendingPasswordChangeValue !== null) {
+        if (rememberPw?.checked || hasRememberedPassword()) {
+          saveRememberedPassword(pendingPasswordChangeValue);
+          if (rememberPw) rememberPw.checked = true;
+        }
+        pendingPasswordChangeValue = null;
+      }
       // Update token
       authToken = msg.token;
-      localStorage.setItem('cc-web-token', msg.token);
+      localStorage.setItem('webcoding-token', msg.token);
       // If force-change overlay is open, close it and load sessions
       const fcOverlay = document.getElementById('force-change-overlay');
       if (fcOverlay) {
@@ -5047,13 +5207,13 @@
 
   function handleForcedLogout(msg) {
     authToken = null;
-    localStorage.removeItem('cc-web-token');
-    document.dispatchEvent(new CustomEvent('cc-web-auth-failed'));
+    localStorage.removeItem('webcoding-token');
+    document.dispatchEvent(new CustomEvent('webcoding-auth-failed'));
     if (isGenerating) finishGenerating();
     hideForceChangePassword();
     loginOverlay.hidden = false;
     app.hidden = true;
-    loginPassword.value = '';
+    restoreRememberedPasswordInput();
     loginError.textContent = msg?.message || '登录状态已失效，请重新登录';
     loginError.hidden = false;
   }
@@ -5545,7 +5705,7 @@
             if (sess.alreadyImported) {
               if (!confirm('已导入过此会话，重新导入将覆盖已有内容。确认继续？')) return;
             } else {
-              if (!confirm('由于 cc-web 与本地 CLI 的逻辑不同，导入会话需要解析后方可展示，导入后将覆盖已有内容。确认继续？')) return;
+              if (!confirm('由于 webcoding 与本地 CLI 的逻辑不同，导入会话需要解析后方可展示，导入后将覆盖已有内容。确认继续？')) return;
             }
             modal.close();
             send({ type: 'import_native_session', sessionId: sess.sessionId, projectDir: group.dir });
@@ -5717,18 +5877,13 @@
   // Register Service Worker for mobile push notifications
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('/sw.js').catch((error) => {
-      console.warn('[CC-SW]', 'service worker register failed', error);
+      console.warn('[WEBCODING-SW]', 'service worker register failed', error);
     });
   }
 
-  // Security hardening: remove legacy plain-text password cache
-  localStorage.removeItem('cc-web-pw');
-  if (rememberPw) {
-    rememberPw.checked = false;
-    rememberPw.disabled = true;
-    const rememberPwLabel = rememberPw.closest('.remember-label');
-    if (rememberPwLabel) rememberPwLabel.hidden = true;
-  }
+  // Clear the removed legacy key from older builds, but keep the new remember-password entry.
+  localStorage.removeItem('webcoding-pw');
+  restoreRememberedPasswordInput();
 
   // Visibility change: re-sync state when user returns to tab (critical for mobile)
   document.addEventListener('visibilitychange', () => {
@@ -5752,6 +5907,7 @@
   if (!connectionState.authToken) {
     loginOverlay.hidden = false;
     app.hidden = true;
+    restoreRememberedPasswordInput();
   } else {
     loginOverlay.hidden = true;
     app.hidden = false;

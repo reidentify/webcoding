@@ -43,6 +43,7 @@ const CODEX_CONFIG_PATH = path.join(CONFIG_DIR, 'codex.json');
 const PROJECTS_CONFIG_PATH = path.join(CONFIG_DIR, 'projects.json');
 const BRIDGE_RUNTIME_PATH = path.join(CONFIG_DIR, 'bridge-runtime.json');
 const BRIDGE_STATE_PATH = path.join(CONFIG_DIR, 'bridge-state.json');
+const CLAUDE_SETTINGS_BACKUP_PATH = path.join(CONFIG_DIR, 'claude-settings-backup.json');
 const BRIDGE_SCRIPT_PATH = path.join(__dirname, 'lib', 'local-api-bridge.js');
 const PUBLIC_ROOT = path.resolve(PUBLIC_DIR);
 const USER_HOME = process.env.HOME || process.env.USERPROFILE || '';
@@ -118,6 +119,13 @@ function writeCachedJsonConfig(filePath, value) {
   } catch {
     jsonConfigCache.set(filePath, { mtimeMs: null, value: cloneJson(value) });
   }
+}
+
+function deleteCachedJsonConfig(filePath) {
+  jsonConfigCache.delete(filePath);
+  try {
+    fs.unlinkSync(filePath);
+  } catch {}
 }
 
 function writeHeadWithSecurity(res, statusCode, headers = {}) {
@@ -545,33 +553,33 @@ let MODEL_MAP = { ...DEFAULT_CLAUDE_MODEL_MAP };
 const CLAUDE_MODEL_MENU_ENTRIES = [
   {
     alias: 'default',
-    label: 'Default (recommended)',
-    desc: 'Use the default model (currently Sonnet 4.6)',
-    pricing: '$3/$15 per Mtok',
+    label: '默认（推荐）',
+    desc: '使用默认模型（当前为 Sonnet 4.6）',
+    pricing: '输入/输出 $3 / $15 / 百万 Token',
   },
   {
     alias: 'sonnet[1m]',
-    label: 'Sonnet (1M context)',
-    desc: 'Sonnet 4.6 for long sessions',
-    pricing: '$3/$15 per Mtok',
+    label: 'Sonnet（1M 上下文）',
+    desc: 'Sonnet 4.6，适合长上下文会话',
+    pricing: '输入/输出 $3 / $15 / 百万 Token',
   },
   {
     alias: 'opus',
     label: 'Opus',
-    desc: 'Opus 4.6 · Most capable for complex work',
-    pricing: '$5/$25 per Mtok',
+    desc: 'Opus 4.6，复杂任务能力最强',
+    pricing: '输入/输出 $5 / $25 / 百万 Token',
   },
   {
     alias: 'opus[1m]',
-    label: 'Opus (1M context)',
-    desc: 'Opus 4.6 with 1M context [NEW] · Most capable for complex work',
-    pricing: '$5/$25 per Mtok',
+    label: 'Opus（1M 上下文）',
+    desc: 'Opus 4.6，支持 1M 上下文，适合复杂任务',
+    pricing: '输入/输出 $5 / $25 / 百万 Token',
   },
   {
     alias: 'haiku',
     label: 'Haiku',
-    desc: 'Haiku 4.5 · Fastest for quick answers',
-    pricing: '$1/$5 per Mtok',
+    desc: 'Haiku 4.5，响应最快，适合快速问答',
+    pricing: '输入/输出 $1 / $5 / 百万 Token',
   },
 ];
 
@@ -581,54 +589,52 @@ const VALID_AGENTS = new Set(['claude', 'codex']);
 let _modelCache = null; // { models: [{id, display_name}], fetchedAt: number, source: 'anthropic'|'openai' }
 
 function resolveActiveApiCredentials() {
-  // Check active custom template first
+  // Check Claude-selected provider first
   try {
-    const config = loadModelConfig();
-    if (config.mode === 'custom' && config.activeTemplate) {
-      const tpl = (config.templates || []).find(t => t.name === config.activeTemplate);
-      if (tpl && tpl.apiKey) {
-        return {
-          apiKey: tpl.apiKey,
-          apiBase: tpl.apiBase || 'https://api.anthropic.com',
-          upstreamType: tpl.upstreamType === 'anthropic' ? 'anthropic' : 'openai',
-        };
-      }
+    const tpl = getClaudeSelectedTemplate(loadModelConfig());
+    if (tpl && tpl.apiKey) {
+      return {
+        apiKey: tpl.apiKey,
+        apiBase: tpl.apiBase || 'https://api.anthropic.com',
+        upstreamType: tpl.upstreamType === 'anthropic' ? 'anthropic' : 'openai',
+      };
     }
   } catch {}
   // Check ~/.claude/settings.json env block
   try {
     const settings = JSON.parse(fs.readFileSync(CLAUDE_SETTINGS_PATH, 'utf8'));
     const env = settings.env || {};
-    const key = env.ANTHROPIC_AUTH_TOKEN || env.ANTHROPIC_API_KEY;
+    const key = env.ANTHROPIC_API_KEY || env.ANTHROPIC_AUTH_TOKEN;
     if (key) return { apiKey: key, apiBase: env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com', upstreamType: 'anthropic' };
   } catch {}
   // Fall back to process.env
-  const key = process.env.ANTHROPIC_AUTH_TOKEN || process.env.ANTHROPIC_API_KEY;
+  const key = process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN;
   if (key) return { apiKey: key, apiBase: process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com', upstreamType: 'anthropic' };
   return null;
 }
 
 function fetchModelsFromApi(credentials) {
   return new Promise((resolve, reject) => {
-    const base = (credentials.apiBase || 'https://api.anthropic.com').replace(/\/$/, '');
-    const url = new URL(base + '/v1/models');
-    url.searchParams.set('limit', '100');
+    const apiBase = credentials.apiBase || 'https://api.anthropic.com';
     const isAnthropic = credentials.upstreamType === 'anthropic';
+    let spec;
+    let url;
+    try {
+      spec = buildModelsRequestSpec(apiBase, credentials.apiKey, credentials.upstreamType);
+      url = new URL(spec.fullUrl);
+    } catch (error) {
+      return reject(error);
+    }
+    url.searchParams.set('limit', '100');
     const options = {
       hostname: url.hostname,
       port: url.port || (url.protocol === 'https:' ? 443 : 80),
       path: url.pathname + (url.search || ''),
       method: 'GET',
-      headers: isAnthropic
-        ? {
-            'x-api-key': credentials.apiKey,
-            'anthropic-version': '2023-06-01',
-            'content-type': 'application/json',
-          }
-        : {
-            Authorization: `Bearer ${credentials.apiKey}`,
-            'content-type': 'application/json',
-          },
+      headers: {
+        ...spec.headers,
+        'content-type': 'application/json',
+      },
     };
     const proto = url.protocol === 'https:' ? https : http;
     const req = proto.request(options, (res) => {
@@ -697,6 +703,56 @@ const DEFAULT_CODEX_CONFIG = {
   supportsSearch: false,
 };
 
+function normalizeModelTemplate(template) {
+  return {
+    name: String(template?.name || '').trim(),
+    apiKey: String(template?.apiKey || ''),
+    apiBase: String(template?.apiBase || '').trim(),
+    upstreamType: template?.upstreamType === 'anthropic' ? 'anthropic' : 'openai',
+    defaultModel: String(template?.defaultModel || '').trim(),
+    opusModel: String(template?.opusModel || '').trim(),
+    sonnetModel: String(template?.sonnetModel || '').trim(),
+    haikuModel: String(template?.haikuModel || '').trim(),
+  };
+}
+
+function normalizeModelTemplates(templates) {
+  return Array.isArray(templates)
+    ? templates.map(normalizeModelTemplate).filter((template) => template.name)
+    : [];
+}
+
+function normalizeModelMode(mode) {
+  return mode === 'custom' ? 'custom' : 'local';
+}
+
+function selectTemplateByName(templates, templateName) {
+  const normalizedName = String(templateName || '').trim();
+  if (!normalizedName) return null;
+  return (Array.isArray(templates) ? templates : []).find((template) => template.name === normalizedName) || null;
+}
+
+function pickConfiguredTemplate(templates, preferredName, fallbackName = '') {
+  return selectTemplateByName(templates, preferredName)
+    || selectTemplateByName(templates, fallbackName)
+    || (Array.isArray(templates) ? templates[0] || null : null);
+}
+
+function getClaudeSelectedTemplate(config = null) {
+  const modelConfig = config || loadModelConfig();
+  if (!modelConfig || normalizeModelMode(modelConfig.mode) !== 'custom') return null;
+  return pickConfiguredTemplate(modelConfig.templates, modelConfig.activeTemplate);
+}
+
+function getCodexSelectedTemplate(codexConfig = null, modelConfig = null) {
+  const resolvedCodexConfig = codexConfig || loadCodexConfig();
+  const resolvedModelConfig = modelConfig || loadModelConfig();
+  const templates = Array.isArray(resolvedModelConfig.templates) ? resolvedModelConfig.templates : [];
+  const preferredName = String(resolvedCodexConfig?.sharedTemplate || '').trim();
+  const fallbackName = !preferredName ? String(resolvedModelConfig.activeTemplate || '').trim() : '';
+  return pickConfiguredTemplate(templates, preferredName, fallbackName);
+}
+
 function normalizeCodexProfile(profile) {
   return {
     name: String(profile?.name || '').trim(),
@@ -722,11 +778,36 @@ function resolveCodexLegacyMode(raw) {
 }
 
 function loadModelConfig() {
-  return readCachedJsonConfig(MODEL_CONFIG_PATH) || cloneJson(DEFAULT_MODEL_CONFIG);
+  const raw = readCachedJsonConfig(MODEL_CONFIG_PATH);
+  if (!raw) return cloneJson(DEFAULT_MODEL_CONFIG);
+  const templates = normalizeModelTemplates(raw.templates);
+  const normalized = {
+    mode: normalizeModelMode(raw.mode),
+    activeTemplate: String(raw.activeTemplate || '').trim(),
+    templates,
+  };
+  if (normalized.mode === 'custom' && !selectTemplateByName(templates, normalized.activeTemplate)) {
+    normalized.activeTemplate = templates[0]?.name || '';
+  }
+  if (normalized.mode === 'local') {
+    normalized.activeTemplate = '';
+  }
+  return normalized;
 }
 
 function saveModelConfig(config) {
-  writeCachedJsonConfig(MODEL_CONFIG_PATH, config);
+  const normalized = {
+    mode: normalizeModelMode(config?.mode),
+    activeTemplate: String(config?.activeTemplate || '').trim(),
+    templates: normalizeModelTemplates(config?.templates),
+  };
+  if (normalized.mode === 'custom' && !selectTemplateByName(normalized.templates, normalized.activeTemplate)) {
+    normalized.activeTemplate = normalized.templates[0]?.name || '';
+  }
+  if (normalized.mode === 'local') {
+    normalized.activeTemplate = '';
+  }
+  writeCachedJsonConfig(MODEL_CONFIG_PATH, normalized);
 }
 
 // === Projects Config ===
@@ -772,11 +853,14 @@ function saveCodexConfig(config) {
 
 function getCodexConfigMasked() {
   const config = loadCodexConfig();
+  const effectiveTemplate = normalizeCodexMode(config.mode) === 'unified'
+    ? getCodexSelectedTemplate(config, loadModelConfig())
+    : null;
   return {
     mode: normalizeCodexMode(config.mode),
     legacyMode: resolveCodexLegacyMode(config.legacyMode),
     activeProfile: config.activeProfile || '',
-    sharedTemplate: config.sharedTemplate || '',
+    sharedTemplate: effectiveTemplate?.name || config.sharedTemplate || '',
     profiles: (config.profiles || []).map((profile) => ({
       name: profile.name,
       apiKey: maskSecret(profile.apiKey),
@@ -845,24 +929,18 @@ function resolveCodexCustomProfile(config) {
 
 function resolveCodexUnifiedSource(config) {
   const modelConfig = loadModelConfig();
-  const templates = Array.isArray(modelConfig.templates) ? modelConfig.templates : [];
-  const activeTemplateName = String(modelConfig.activeTemplate || '').trim();
-  const fallbackTemplateName = String(config?.sharedTemplate || '').trim();
   // Fallback priority:
-  // 1) unified activeTemplate
-  // 2) codex sharedTemplate
-  // 3) first available unified template
+  // 1) Codex selected provider
+  // 2) legacy Claude-selected provider (for old configs that never chose a separate Codex provider)
+  // 3) first available provider
   // 4) legacy custom profile
   // 5) legacy shared(local Claude credentials)
-  const template = (activeTemplateName && templates.find((item) => item.name === activeTemplateName))
-    || (fallbackTemplateName && templates.find((item) => item.name === fallbackTemplateName))
-    || templates[0]
-    || null;
+  const template = getCodexSelectedTemplate(config, modelConfig);
 
   if (template) {
     if (!template.apiKey || !template.apiBase) {
       if (config?.legacyMode === 'custom') return resolveCodexCustomProfile(config);
-      return { error: `统一 API 配置「${template.name}」缺少 API Key 或 API Base URL。` };
+      return { error: `AI 提供商配置「${template.name}」缺少 API Key 或 API Base URL。` };
     }
     return {
       mode: 'unified',
@@ -892,12 +970,34 @@ function resolveCodexUnifiedSource(config) {
     }
   }
 
-  return { error: '当前没有可用的统一 API 配置。请先在设置中创建并激活一个 API 配置。' };
+  return { error: '当前没有可用的 AI 提供商配置。请先在设置中创建至少一个可用提供商。' };
 }
 
 function resolveCodexActiveSource(config) {
   if (!config || normalizeCodexMode(config.mode) === 'local') return { mode: 'local' };
   return resolveCodexUnifiedSource(config);
+}
+
+function getCodexRuntimeFingerprint(config) {
+  const source = resolveCodexActiveSource(config || loadCodexConfig());
+  if (!source || source.mode === 'local') {
+    const codexLocalConfigPath = path.join(process.env.HOME || process.env.USERPROFILE || '', '.codex', 'config.toml');
+    const codexLocalAuthPath = path.join(process.env.HOME || process.env.USERPROFILE || '', '.codex', 'auth.json');
+    return JSON.stringify({
+      runtimeVersion: 5,
+      mode: 'local',
+      configFingerprint: fileContentFingerprint(codexLocalConfigPath),
+      authFingerprint: fileContentFingerprint(codexLocalAuthPath),
+    });
+  }
+  if (source.error) return `error:${source.error}`;
+  return JSON.stringify({
+    runtimeVersion: 5,
+    mode: 'remote',
+    sourceName: String(source.name || '').trim(),
+    apiBase: String(source.apiBase || '').trim().replace(/\/+$/, ''),
+    upstreamType: String(source.upstreamType || 'openai').toLowerCase(),
+  });
 }
 
 function prepareCodexCustomRuntime(config) {
@@ -914,12 +1014,15 @@ function prepareCodexCustomRuntime(config) {
 
   fs.mkdirSync(CODEX_RUNTIME_HOME, { recursive: true });
   const configToml = [
+    '# Generated by webcoding. Codex startup is also forced via CLI -c overrides.',
+    `# bridge_base_url = ${tomlString(bridge.openaiBaseUrl)}`,
+    `# bridge_api_key = ${tomlString(bridge.token)}`,
     bridge.defaultModel ? `model = ${tomlString(bridge.defaultModel)}` : null,
     'preferred_auth_method = "apikey"',
     'model_provider = "openai_compat"',
     '',
     '[model_providers.openai_compat]',
-    `name = ${tomlString(source.name || 'Unified API Config')}`,
+    `name = ${tomlString(source.name || 'AI Provider')}`,
     `base_url = ${tomlString(bridge.openaiBaseUrl)}`,
     'env_key = "OPENAI_API_KEY"',
     'wire_api = "responses"',
@@ -997,20 +1100,21 @@ function getCodexModelsCachePaths(config) {
   return paths;
 }
 
-function buildFetchModelsUrl(apiBase, agent = 'claude') {
+function buildVersionedEndpointUrl(apiBase, endpoint) {
   const base = String(apiBase || '').trim().replace(/\/+$/, '');
+  const normalizedEndpoint = String(endpoint || '').trim().replace(/^\/+/, '');
   if (!base) throw new Error('缺少 API Base URL');
-  if (/\/models$/i.test(base)) return base;
-  if (agent === 'codex') {
-    return /\/v\d+(?:\.\d+)?$/i.test(base) ? `${base}/models` : `${base}/v1/models`;
-  }
-  return `${base}/v1/models`;
+  if (!normalizedEndpoint) throw new Error('缺少 API endpoint');
+  if (base.toLowerCase().endsWith(`/${normalizedEndpoint.toLowerCase()}`)) return base;
+  return /\/v\d+(?:\.\d+)?$/i.test(base) ? `${base}/${normalizedEndpoint}` : `${base}/v1/${normalizedEndpoint}`;
 }
 
-function buildModelsRequestSpec(apiBase, apiKey, upstreamType = 'openai', agent = 'claude') {
-  const fullUrl = upstreamType === 'anthropic'
-    ? buildFetchModelsUrl(apiBase, 'claude')
-    : buildFetchModelsUrl(apiBase, agent);
+function buildFetchModelsUrl(apiBase) {
+  return buildVersionedEndpointUrl(apiBase, 'models');
+}
+
+function buildModelsRequestSpec(apiBase, apiKey, upstreamType = 'openai') {
+  const fullUrl = buildFetchModelsUrl(apiBase);
   const headers = upstreamType === 'anthropic'
     ? {
         'x-api-key': apiKey,
@@ -1048,7 +1152,7 @@ function fetchCodexModelsFromApi(profile) {
     let url;
     let spec;
     try {
-      spec = buildModelsRequestSpec(base, token, upstreamType, upstreamType === 'anthropic' ? 'claude' : 'codex');
+      spec = buildModelsRequestSpec(base, token, upstreamType);
       url = new URL(spec.fullUrl);
     } catch (error) {
       return reject(error);
@@ -1098,8 +1202,9 @@ async function getCodexModelMenuPayload(session) {
   const currentFull = session?.model || '';
   const current = currentFull || 'default';
   const modelConfig = loadModelConfig();
-  const activeTemplate = modelConfig.mode === 'custom'
-    ? ((modelConfig.templates || []).find((item) => item.name === modelConfig.activeTemplate) || null)
+  const codexConfig = loadCodexConfig();
+  const activeTemplate = normalizeCodexMode(codexConfig.mode) === 'unified'
+    ? getCodexSelectedTemplate(codexConfig, modelConfig)
     : null;
   let dynamicEntries = [];
   let source = null;
@@ -1117,7 +1222,7 @@ async function getCodexModelMenuPayload(session) {
   }
 
   if (!dynamicEntries.length) {
-    for (const cachePath of getCodexModelsCachePaths({ mode: modelConfig.mode })) {
+    for (const cachePath of getCodexModelsCachePaths(codexConfig)) {
       const cached = loadCodexModelsCacheEntries(cachePath);
       if (cached?.entries?.length) {
         dynamicEntries = cached.entries;
@@ -1129,7 +1234,7 @@ async function getCodexModelMenuPayload(session) {
 
   const entries = [{
     value: 'default',
-    label: 'Default',
+    label: '默认模型（Codex）',
     desc: activeTemplate?.defaultModel
       ? `使用当前 Codex 默认模型（${activeTemplate.defaultModel}）`
       : '使用当前 Codex 默认模型',
@@ -1140,7 +1245,7 @@ async function getCodexModelMenuPayload(session) {
     entries.push({
       value: activeTemplate.defaultModel,
       label: activeTemplate.defaultModel,
-      desc: '当前统一配置默认模型',
+      desc: '当前 AI 提供商默认模型（Codex）',
     });
   }
   for (const entry of dynamicEntries) {
@@ -1166,22 +1271,40 @@ async function getCodexModelMenuPayload(session) {
   };
 }
 
-// Read ~/.claude.json for model name overrides
-function loadClaudeJsonModelMap() {
+function extractClaudeModelMapFromEnv(env) {
+  const map = {};
+  if (env?.ANTHROPIC_DEFAULT_OPUS_MODEL) map.opus = String(env.ANTHROPIC_DEFAULT_OPUS_MODEL).trim();
+  if (env?.ANTHROPIC_DEFAULT_SONNET_MODEL) map.sonnet = String(env.ANTHROPIC_DEFAULT_SONNET_MODEL).trim();
+  if (env?.ANTHROPIC_DEFAULT_HAIKU_MODEL) map.haiku = String(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).trim();
+  if (!map.opus && env?.ANTHROPIC_MODEL) map.opus = String(env.ANTHROPIC_MODEL).trim();
+  return Object.keys(map).length > 0 ? map : null;
+}
+
+function loadClaudeLocalModelMap() {
+  const settingsEnv = readClaudeSettingsEnv();
+  const settingsMap = extractClaudeModelMapFromEnv(settingsEnv);
+  if (settingsMap) return settingsMap;
+
   try {
     const p = path.join(process.env.HOME || process.env.USERPROFILE || '', '.claude.json');
-    if (!fs.existsSync(p)) return null;
-    const raw = JSON.parse(fs.readFileSync(p, 'utf8'));
-    const env = raw?.env || {};
-    const map = {};
-    if (env.ANTHROPIC_DEFAULT_OPUS_MODEL) map.opus = env.ANTHROPIC_DEFAULT_OPUS_MODEL;
-    if (env.ANTHROPIC_DEFAULT_SONNET_MODEL) map.sonnet = env.ANTHROPIC_DEFAULT_SONNET_MODEL;
-    if (env.ANTHROPIC_DEFAULT_HAIKU_MODEL) map.haiku = env.ANTHROPIC_DEFAULT_HAIKU_MODEL;
-    // Fallback: ANTHROPIC_MODEL maps to opus slot
-    if (!map.opus && env.ANTHROPIC_MODEL) map.opus = env.ANTHROPIC_MODEL;
-    return Object.keys(map).length > 0 ? map : null;
+    if (fs.existsSync(p)) {
+      const raw = JSON.parse(fs.readFileSync(p, 'utf8'));
+      const claudeJsonMap = extractClaudeModelMapFromEnv(raw?.env || {});
+      if (claudeJsonMap) return claudeJsonMap;
+    }
+  } catch {}
+
+  const processMap = extractClaudeModelMapFromEnv(process.env || {});
+  return processMap;
+}
+
+function fileContentFingerprint(filePath) {
+  try {
+    if (!filePath || !fs.existsSync(filePath)) return 'missing';
+    const content = fs.readFileSync(filePath);
+    return crypto.createHash('sha256').update(content).digest('hex');
   } catch {
-    return null;
+    return 'unreadable';
   }
 }
 
@@ -1190,19 +1313,155 @@ const CLAUDE_SETTINGS_PATH = path.join(process.env.HOME || process.env.USERPROFI
 const SETTINGS_API_KEYS = ['ANTHROPIC_AUTH_TOKEN','ANTHROPIC_API_KEY','ANTHROPIC_BASE_URL','ANTHROPIC_MODEL',
   'ANTHROPIC_DEFAULT_OPUS_MODEL','ANTHROPIC_DEFAULT_SONNET_MODEL','ANTHROPIC_DEFAULT_HAIKU_MODEL',
   'ANTHROPIC_REASONING_MODEL'];
+const LOCAL_CLAUDE_BRIDGE_BASE_RE = /^http:\/\/127\.0\.0\.1:\d+\/anthropic\/?$/i;
 
-function readClaudeSettingsEnv() {
+function readClaudeSettings() {
   try {
-    const settings = JSON.parse(fs.readFileSync(CLAUDE_SETTINGS_PATH, 'utf8'));
-    return settings?.env && typeof settings.env === 'object' ? settings.env : {};
+    const parsed = JSON.parse(fs.readFileSync(CLAUDE_SETTINGS_PATH, 'utf8'));
+    return parsed && typeof parsed === 'object' ? parsed : {};
   } catch {
     return {};
   }
 }
 
+function readClaudeSettingsSnapshot() {
+  const exists = fs.existsSync(CLAUDE_SETTINGS_PATH);
+  return {
+    exists,
+    settings: readClaudeSettings(),
+  };
+}
+
+function writeClaudeSettings(settings) {
+  try {
+    fs.mkdirSync(path.dirname(CLAUDE_SETTINGS_PATH), { recursive: true });
+    writeJsonAtomic(CLAUDE_SETTINGS_PATH, settings && typeof settings === 'object' ? settings : {});
+  } catch {}
+}
+
+function deleteClaudeSettingsFile() {
+  try {
+    fs.unlinkSync(CLAUDE_SETTINGS_PATH);
+  } catch {}
+}
+
+function stripManagedClaudeSettingsEnv(env) {
+  const cleanedEnv = {};
+  for (const [k, v] of Object.entries(env || {})) {
+    if (!SETTINGS_API_KEYS.includes(k)) cleanedEnv[k] = v;
+  }
+  return cleanedEnv;
+}
+
+function extractManagedClaudeSettingsEnv(env) {
+  const managedEnv = {};
+  for (const key of SETTINGS_API_KEYS) {
+    if (!Object.prototype.hasOwnProperty.call(env || {}, key)) continue;
+    const value = env[key];
+    if (value === undefined || value === null) continue;
+    const normalized = String(value).trim();
+    if (normalized) managedEnv[key] = normalized;
+  }
+  return managedEnv;
+}
+
+function buildManagedClaudeSettingsEnv(tpl, bridge) {
+  const managedEnv = {};
+  const defaultModel = String(tpl?.defaultModel || '').trim();
+  const opusModel = String(tpl?.opusModel || defaultModel || '').trim();
+  const sonnetModel = String(tpl?.sonnetModel || defaultModel || '').trim();
+  const haikuModel = String(tpl?.haikuModel || defaultModel || '').trim();
+
+  if (bridge?.token) {
+    managedEnv.ANTHROPIC_API_KEY = String(bridge.token).trim();
+  } else if (tpl?.apiKey) {
+    managedEnv.ANTHROPIC_API_KEY = String(tpl.apiKey).trim();
+  }
+  if (bridge?.anthropicBaseUrl) managedEnv.ANTHROPIC_BASE_URL = String(bridge.anthropicBaseUrl).trim();
+  else if (tpl?.apiBase) managedEnv.ANTHROPIC_BASE_URL = String(tpl.apiBase).trim();
+  if (defaultModel) managedEnv.ANTHROPIC_MODEL = defaultModel;
+  if (opusModel) managedEnv.ANTHROPIC_DEFAULT_OPUS_MODEL = opusModel;
+  if (sonnetModel) managedEnv.ANTHROPIC_DEFAULT_SONNET_MODEL = sonnetModel;
+  if (haikuModel) managedEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL = haikuModel;
+  return managedEnv;
+}
+
+function managedClaudeSettingsEnvEquals(left, right) {
+  const normalizedLeft = extractManagedClaudeSettingsEnv(left);
+  const normalizedRight = extractManagedClaudeSettingsEnv(right);
+  const keys = new Set([...Object.keys(normalizedLeft), ...Object.keys(normalizedRight)]);
+  for (const key of keys) {
+    if (String(normalizedLeft[key] || '') !== String(normalizedRight[key] || '')) return false;
+  }
+  return true;
+}
+
+function looksLikeManagedClaudeBridgeEnv(env, bridgeTokens) {
+  const managedEnv = extractManagedClaudeSettingsEnv(env);
+  const tokenSet = new Set(
+    Array.isArray(bridgeTokens)
+      ? bridgeTokens.map((token) => String(token || '').trim()).filter(Boolean)
+      : [String(bridgeTokens || '').trim()].filter(Boolean)
+  );
+  if (!tokenSet.size) return false;
+  return tokenSet.has(String(managedEnv.ANTHROPIC_API_KEY || '').trim())
+    && LOCAL_CLAUDE_BRIDGE_BASE_RE.test(String(managedEnv.ANTHROPIC_BASE_URL || ''));
+}
+
+function loadClaudeSettingsBackup() {
+  const raw = readCachedJsonConfig(CLAUDE_SETTINGS_BACKUP_PATH);
+  if (!raw || typeof raw !== 'object') return null;
+  if (Number(raw.version) !== 2) {
+    clearClaudeSettingsBackup();
+    return null;
+  }
+  return {
+    version: 2,
+    exists: raw.exists !== false,
+    settings: raw.settings && typeof raw.settings === 'object'
+      ? cloneJson(raw.settings)
+      : null,
+    capturedAt: String(raw.capturedAt || '').trim() || null,
+  };
+}
+
+function saveClaudeSettingsBackup(snapshot) {
+  writeCachedJsonConfig(CLAUDE_SETTINGS_BACKUP_PATH, {
+    version: 2,
+    exists: !!snapshot?.exists,
+    settings: snapshot?.exists && snapshot?.settings && typeof snapshot.settings === 'object'
+      ? cloneJson(snapshot.settings)
+      : null,
+    capturedAt: new Date().toISOString(),
+  });
+}
+
+function clearClaudeSettingsBackup() {
+  deleteCachedJsonConfig(CLAUDE_SETTINGS_BACKUP_PATH);
+}
+
+function ensureClaudeSettingsBackupForCustom(currentSnapshot, nextManagedEnv, bridge) {
+  if (loadClaudeSettingsBackup()) return;
+  const settings = currentSnapshot?.settings || {};
+  const currentManagedEnv = extractManagedClaudeSettingsEnv(settings?.env || {});
+  const bridgeTokens = bridge?.token ? [bridge.token] : listBridgeRuntimeTokens();
+  const alreadyManaged = managedClaudeSettingsEnvEquals(currentManagedEnv, nextManagedEnv)
+    || looksLikeManagedClaudeBridgeEnv(currentManagedEnv, bridgeTokens);
+  if (alreadyManaged) return;
+  saveClaudeSettingsBackup({
+    exists: !!currentSnapshot?.exists,
+    settings,
+  });
+}
+
+function readClaudeSettingsEnv() {
+  const settings = readClaudeSettings();
+  return settings?.env && typeof settings.env === 'object' ? settings.env : {};
+}
+
 function readClaudeSettingsCredentials() {
   const env = readClaudeSettingsEnv();
-  const apiKey = String(env.ANTHROPIC_AUTH_TOKEN || env.ANTHROPIC_API_KEY || '').trim();
+  const apiKey = String(env.ANTHROPIC_API_KEY || env.ANTHROPIC_AUTH_TOKEN || '').trim();
   const apiBase = String(env.ANTHROPIC_BASE_URL || '').trim();
   if (!apiKey || !apiBase) return null;
   return {
@@ -1210,6 +1469,27 @@ function readClaudeSettingsCredentials() {
     apiBase,
     defaultModel: String(env.ANTHROPIC_MODEL || env.ANTHROPIC_DEFAULT_OPUS_MODEL || '').trim(),
   };
+}
+
+function getClaudeRuntimeFingerprint(config = null) {
+  const modelConfig = config || loadModelConfig();
+  const tpl = getClaudeSelectedTemplate(modelConfig);
+  if (tpl) {
+    return JSON.stringify({
+      runtimeVersion: 3,
+      mode: 'custom',
+      templateName: String(tpl.name || '').trim(),
+      apiBase: String(tpl.apiBase || '').trim().replace(/\/+$/, ''),
+      upstreamType: String(tpl.upstreamType === 'anthropic' ? 'anthropic' : 'openai'),
+    });
+  }
+
+  return JSON.stringify({
+    runtimeVersion: 1,
+    mode: 'local',
+    settingsFingerprint: fileContentFingerprint(CLAUDE_SETTINGS_PATH),
+    claudeJsonFingerprint: fileContentFingerprint(path.join(process.env.HOME || process.env.USERPROFILE || '', '.claude.json')),
+  });
 }
 
 function applyCustomTemplateToSettings(tpl, existingBridge) {
@@ -1221,74 +1501,76 @@ function applyCustomTemplateToSettings(tpl, existingBridge) {
       bridge = null;
     }
   }
-  let settings = {};
-  try { settings = JSON.parse(fs.readFileSync(CLAUDE_SETTINGS_PATH, 'utf8')); } catch {}
-  const cleanedEnv = {};
-  for (const [k, v] of Object.entries(settings.env || {})) {
-    if (!SETTINGS_API_KEYS.includes(k)) cleanedEnv[k] = v;
-  }
-  const defaultModel = String(tpl.defaultModel || '').trim();
-  const opusModel = String(tpl.opusModel || defaultModel || '').trim();
-  const sonnetModel = String(tpl.sonnetModel || defaultModel || '').trim();
-  const haikuModel = String(tpl.haikuModel || defaultModel || '').trim();
+  const currentSnapshot = readClaudeSettingsSnapshot();
+  const settings = cloneJson(currentSnapshot.settings) || {};
+  const managedEnv = buildManagedClaudeSettingsEnv(tpl, bridge);
+  ensureClaudeSettingsBackupForCustom(currentSnapshot, managedEnv, bridge);
+  settings.env = {
+    ...stripManagedClaudeSettingsEnv(settings.env),
+    ...managedEnv,
+  };
+  writeClaudeSettings(settings);
+}
 
-  if (bridge?.token) {
-    cleanedEnv.ANTHROPIC_AUTH_TOKEN = bridge.token;
-    cleanedEnv.ANTHROPIC_API_KEY = bridge.token;
-  } else if (tpl.apiKey) {
-    cleanedEnv.ANTHROPIC_AUTH_TOKEN = tpl.apiKey;
-    cleanedEnv.ANTHROPIC_API_KEY = tpl.apiKey;
-  }
-  if (bridge?.anthropicBaseUrl) cleanedEnv.ANTHROPIC_BASE_URL = bridge.anthropicBaseUrl;
-  else if (tpl.apiBase) cleanedEnv.ANTHROPIC_BASE_URL = tpl.apiBase;
-  if (defaultModel) cleanedEnv.ANTHROPIC_MODEL = defaultModel;
-  if (opusModel) cleanedEnv.ANTHROPIC_DEFAULT_OPUS_MODEL = opusModel;
-  if (sonnetModel) cleanedEnv.ANTHROPIC_DEFAULT_SONNET_MODEL = sonnetModel;
-  if (haikuModel) cleanedEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL = haikuModel;
-  settings.env = cleanedEnv;
-  // 原子写入：先写临时文件再 rename，避免 Claude 子进程读到写了一半的文件
-  const tmpPath = CLAUDE_SETTINGS_PATH + '.tmp';
+function refreshCodexGeneratedRuntimeSnapshot(context = 'runtime_refresh') {
   try {
-    fs.mkdirSync(path.dirname(CLAUDE_SETTINGS_PATH), { recursive: true });
-    fs.writeFileSync(tmpPath, JSON.stringify(settings, null, 2));
-    fs.renameSync(tmpPath, CLAUDE_SETTINGS_PATH);
-  } catch {
-    try { fs.unlinkSync(tmpPath); } catch {}
+    const result = prepareCodexCustomRuntime(loadCodexConfig());
+    if (result?.error) {
+      plog('WARN', context, { error: result.error });
+    }
+  } catch (error) {
+    plog('WARN', context, { error: error.message });
   }
 }
 
-function clearManagedClaudeSettings() {
-  let settings = {};
-  try { settings = JSON.parse(fs.readFileSync(CLAUDE_SETTINGS_PATH, 'utf8')); } catch {}
-  const cleanedEnv = {};
-  for (const [k, v] of Object.entries(settings.env || {})) {
-    if (!SETTINGS_API_KEYS.includes(k)) cleanedEnv[k] = v;
+function restoreManagedClaudeSettings(previousTemplate = null, options = {}) {
+  const backup = loadClaudeSettingsBackup();
+  if (!backup && options.onlyIfBackupExists) return false;
+
+  const settings = readClaudeSettings();
+  const cleanedEnv = stripManagedClaudeSettingsEnv(settings.env);
+
+  if (backup) {
+    if (backup.settings && backup.exists !== false) {
+      writeClaudeSettings(backup.settings);
+      clearClaudeSettingsBackup();
+      return true;
+    }
+    if (backup.exists === false) {
+      deleteClaudeSettingsFile();
+      clearClaudeSettingsBackup();
+      return true;
+    }
+
+    return false;
   }
+
+  const currentManagedEnv = extractManagedClaudeSettingsEnv(settings.env);
+  if (!Object.keys(currentManagedEnv).length || !previousTemplate) return false;
+
+  const fallbackManagedEnv = buildManagedClaudeSettingsEnv(previousTemplate, null);
+  const bridgeTokens = listBridgeRuntimeTokens();
+  const shouldClear = managedClaudeSettingsEnvEquals(currentManagedEnv, fallbackManagedEnv)
+    || looksLikeManagedClaudeBridgeEnv(currentManagedEnv, bridgeTokens);
+  if (!shouldClear) return false;
+
   settings.env = cleanedEnv;
-  const tmpPath = CLAUDE_SETTINGS_PATH + '.tmp';
-  try {
-    fs.mkdirSync(path.dirname(CLAUDE_SETTINGS_PATH), { recursive: true });
-    fs.writeFileSync(tmpPath, JSON.stringify(settings, null, 2));
-    fs.renameSync(tmpPath, CLAUDE_SETTINGS_PATH);
-  } catch {
-    try { fs.unlinkSync(tmpPath); } catch {}
-  }
+  writeClaudeSettings(settings);
+  return true;
 }
 
 function applyModelConfig() {
   const config = loadModelConfig();
-  if (config.mode === 'custom' && config.activeTemplate) {
-    const tpl = (config.templates || []).find(t => t.name === config.activeTemplate);
-    if (tpl) {
-      const defaultModel = String(tpl.defaultModel || '').trim();
-      if (tpl.opusModel || defaultModel) MODEL_MAP.opus = tpl.opusModel || defaultModel;
-      if (tpl.sonnetModel || defaultModel) MODEL_MAP.sonnet = tpl.sonnetModel || defaultModel;
-      if (tpl.haikuModel || defaultModel) MODEL_MAP.haiku = tpl.haikuModel || defaultModel;
-      if (defaultModel || tpl.opusModel || tpl.sonnetModel || tpl.haikuModel) return;
-    }
+  const tpl = getClaudeSelectedTemplate(config);
+  if (tpl) {
+    const defaultModel = String(tpl.defaultModel || '').trim();
+    if (tpl.opusModel || defaultModel) MODEL_MAP.opus = tpl.opusModel || defaultModel;
+    if (tpl.sonnetModel || defaultModel) MODEL_MAP.sonnet = tpl.sonnetModel || defaultModel;
+    if (tpl.haikuModel || defaultModel) MODEL_MAP.haiku = tpl.haikuModel || defaultModel;
+    if (defaultModel || tpl.opusModel || tpl.sonnetModel || tpl.haikuModel) return;
   }
-  // mode === 'local': read model names from ~/.claude.json
-  const localMap = loadClaudeJsonModelMap();
+  // mode === 'local': read model names from local Claude settings / env overrides
+  const localMap = loadClaudeLocalModelMap();
   if (localMap) {
     if (localMap.opus) MODEL_MAP.opus = localMap.opus;
     if (localMap.sonnet) MODEL_MAP.sonnet = localMap.sonnet;
@@ -1303,7 +1585,10 @@ try {
   if (activeTemplate) {
     const bridge = ensureBridgeRuntimeForTemplate(activeTemplate);
     applyCustomTemplateToSettings(activeTemplate, bridge);
+  } else {
+    restoreManagedClaudeSettings(null, { onlyIfBackupExists: true });
   }
+  refreshCodexGeneratedRuntimeSnapshot('codex_runtime_refresh_on_startup');
 } catch (error) {
   plog('WARN', 'bridge_startup_init_failed', { error: error.message });
 }
@@ -1317,6 +1602,25 @@ const MIME_TYPES = {
   '.svg': 'image/svg+xml',
   '.ico': 'image/x-icon',
 };
+
+function getPublicAssetVersion(name) {
+  try {
+    const stat = fs.statSync(path.join(PUBLIC_ROOT, name));
+    return Math.trunc(stat.mtimeMs).toString(36);
+  } catch {
+    return 'dev';
+  }
+}
+
+function renderIndexHtml() {
+  const indexPath = path.join(PUBLIC_ROOT, 'index.html');
+  const html = fs.readFileSync(indexPath, 'utf8');
+  const styleVersion = getPublicAssetVersion('style.css');
+  const appVersion = getPublicAssetVersion('app.js');
+  return html
+    .replace('href="style.css"', `href="style.css?v=${styleVersion}"`)
+    .replace('src="app.js"', `src="app.js?v=${appVersion}"`);
+}
 
 // === Utility Functions ===
 
@@ -1513,16 +1817,495 @@ function jsonResponse(res, statusCode, payload) {
 
 const INITIAL_HISTORY_COUNT = 12;
 const HISTORY_CHUNK_SIZE = 24;
+const CONTEXT_REPLAY_RECENT_MESSAGE_LIMIT = 6;
+const CONTEXT_REPLAY_MESSAGE_CHAR_LIMIT = 900;
+const CONTEXT_REPLAY_RECENT_CHAR_BUDGET = 4200;
+const CONTEXT_REPLAY_MIN_DETAILED_SUMMARY_MESSAGES = 4;
+const CONTEXT_REPLAY_MIN_DETAILED_SUMMARY_CHARS = 280;
+const CONTEXT_REPLAY_FIELD_CHAR_LIMIT = 240;
+const CONTEXT_REPLAY_MAX_COMPLETED_ITEMS = 3;
+const CONTEXT_REPLAY_MAX_CONSTRAINT_ITEMS = 4;
+const CONTEXT_REPLAY_MAX_EXACT_ITEMS = 4;
+const CONTEXT_REPLAY_SUMMARY_MAX_CHARS = 3200;
 
 function normalizeAgent(agent) {
   return VALID_AGENTS.has(agent) ? agent : 'claude';
+}
+
+function normalizeRuntimeContextEntry(entry) {
+  if (!entry || typeof entry !== 'object') return null;
+  const runtimeId = entry.runtimeId ? String(entry.runtimeId) : null;
+  const runtimeFingerprint = entry.runtimeFingerprint ? String(entry.runtimeFingerprint) : null;
+  const descriptor = entry.descriptor && typeof entry.descriptor === 'object' && !Array.isArray(entry.descriptor)
+    ? cloneJson(entry.descriptor)
+    : null;
+  const updatedAt = entry.updatedAt ? String(entry.updatedAt) : null;
+  const model = String(entry.model || '').trim();
+  if (!runtimeId && !runtimeFingerprint && !descriptor && !updatedAt) return null;
+  return {
+    runtimeId,
+    runtimeFingerprint,
+    updatedAt,
+    model,
+    descriptor,
+    legacy: !!entry.legacy,
+  };
+}
+
+function normalizeRuntimeApiBase(value) {
+  return String(value || '').trim().replace(/\/+$/, '');
+}
+
+function normalizeRuntimeUpstreamType(value) {
+  return String(value === 'anthropic' ? 'anthropic' : (value || 'openai')).toLowerCase();
+}
+
+function buildRuntimeChannelIdentityDescriptor(agent, descriptor = null) {
+  const normalizedAgent = normalizeAgent(agent);
+  const mode = String(descriptor?.mode || 'local').toLowerCase();
+  if (mode === 'legacy') {
+    return {
+      mode: 'legacy',
+      runtimeIdHint: String(descriptor?.runtimeIdHint || ''),
+      runtimeFingerprintHint: String(descriptor?.runtimeFingerprintHint || ''),
+    };
+  }
+  if (mode === 'error') {
+    return {
+      mode: 'error',
+      error: String(descriptor?.error || ''),
+    };
+  }
+  if (mode === 'local') {
+    return { mode: 'local' };
+  }
+  if (normalizedAgent === 'codex') {
+    return {
+      mode: 'remote',
+      sourceName: String(descriptor?.sourceName || ''),
+      apiBase: normalizeRuntimeApiBase(descriptor?.apiBase),
+      upstreamType: normalizeRuntimeUpstreamType(descriptor?.upstreamType),
+    };
+  }
+  return {
+    mode: 'custom',
+    templateName: String(descriptor?.templateName || ''),
+    apiBase: normalizeRuntimeApiBase(descriptor?.apiBase),
+    upstreamType: normalizeRuntimeUpstreamType(descriptor?.upstreamType),
+  };
+}
+
+function normalizeRuntimeFingerprintForComparison(agent, fingerprint) {
+  const raw = String(fingerprint || '').trim();
+  if (!raw) return null;
+  if (raw.startsWith('error:')) {
+    return { mode: 'error', error: raw.slice('error:'.length) };
+  }
+  let parsed = null;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { raw };
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { raw };
+  }
+  const mode = String(parsed.mode || 'local').toLowerCase();
+  if (mode === 'local') {
+    if (normalizeAgent(agent) === 'codex') {
+      return {
+        mode: 'local',
+        configFingerprint: String(parsed.configFingerprint || ''),
+        authFingerprint: String(parsed.authFingerprint || ''),
+      };
+    }
+    return {
+      mode: 'local',
+      settingsFingerprint: String(parsed.settingsFingerprint || ''),
+      claudeJsonFingerprint: String(parsed.claudeJsonFingerprint || ''),
+    };
+  }
+  if (mode === 'error') {
+    return { mode: 'error', error: String(parsed.error || '') };
+  }
+  return buildRuntimeChannelIdentityDescriptor(agent, parsed);
+}
+
+function runtimeFingerprintsCompatible(agent, left, right) {
+  const normalizedLeft = normalizeRuntimeFingerprintForComparison(agent, left);
+  const normalizedRight = normalizeRuntimeFingerprintForComparison(agent, right);
+  if (!normalizedLeft || !normalizedRight) return false;
+  return JSON.stringify(normalizedLeft) === JSON.stringify(normalizedRight);
+}
+
+function runtimeChannelDescriptorsCompatible(agent, left, right) {
+  const normalizedLeft = buildRuntimeChannelIdentityDescriptor(agent, left);
+  const normalizedRight = buildRuntimeChannelIdentityDescriptor(agent, right);
+  return JSON.stringify(normalizedLeft) === JSON.stringify(normalizedRight);
+}
+
+function ensureRuntimeContextStore(session) {
+  if (!session || typeof session !== 'object') {
+    return { claude: {}, codex: {} };
+  }
+  const store = session.runtimeContexts && typeof session.runtimeContexts === 'object' && !Array.isArray(session.runtimeContexts)
+    ? session.runtimeContexts
+    : {};
+  if (!store.claude || typeof store.claude !== 'object' || Array.isArray(store.claude)) store.claude = {};
+  if (!store.codex || typeof store.codex !== 'object' || Array.isArray(store.codex)) store.codex = {};
+  session.runtimeContexts = store;
+  return store;
+}
+
+function currentSessionModelOverride(session) {
+  return String(session?.model || '').trim();
+}
+
+function buildClaudeRuntimeChannelDescriptor(session, options = {}) {
+  const modelConfig = options.modelConfig || loadModelConfig();
+  const explicitModel = currentSessionModelOverride(session);
+  const tpl = getClaudeSelectedTemplate(modelConfig);
+  if (tpl) {
+    return {
+      mode: 'custom',
+      templateName: String(tpl.name || ''),
+      apiBase: String(tpl.apiBase || ''),
+      upstreamType: String(tpl.upstreamType === 'anthropic' ? 'anthropic' : 'openai'),
+      defaultModel: String(tpl.defaultModel || ''),
+      explicitModel,
+    };
+  }
+  return {
+    mode: 'local',
+    explicitModel,
+  };
+}
+
+function buildCodexRuntimeChannelDescriptor(session, options = {}) {
+  const codexConfig = options.codexConfig || loadCodexConfig();
+  const explicitModel = currentSessionModelOverride(session);
+  const source = resolveCodexActiveSource(codexConfig);
+  if (!source || source.mode === 'local') {
+    return {
+      mode: 'local',
+      explicitModel,
+    };
+  }
+  if (source.error) {
+    return {
+      mode: 'error',
+      error: String(source.error || ''),
+      explicitModel,
+    };
+  }
+  return {
+    mode: String(source.mode || 'unified'),
+    sourceName: String(source.name || ''),
+    apiBase: String(source.apiBase || ''),
+    upstreamType: String(source.upstreamType || 'openai'),
+    defaultModel: String(source.defaultModel || ''),
+    explicitModel,
+  };
+}
+
+function buildRuntimeChannelDescriptor(session, agent, options = {}) {
+  const normalizedAgent = normalizeAgent(agent || session?.agent);
+  if (normalizedAgent === 'codex') return buildCodexRuntimeChannelDescriptor(session, options);
+  return buildClaudeRuntimeChannelDescriptor(session, options);
+}
+
+function buildRuntimeChannelKey(agent, descriptor) {
+  const normalizedAgent = normalizeAgent(agent);
+  const identityDescriptor = buildRuntimeChannelIdentityDescriptor(normalizedAgent, descriptor);
+  const digest = crypto.createHash('sha1')
+    .update(JSON.stringify(identityDescriptor))
+    .digest('hex');
+  return `${normalizedAgent}:${digest}`;
+}
+
+function getLegacyRuntimeMirror(session, agent) {
+  if (!session) return { runtimeId: null, runtimeFingerprint: null };
+  if (normalizeAgent(agent || session?.agent) === 'codex') {
+    return {
+      runtimeId: session.codexThreadId ? String(session.codexThreadId) : null,
+      runtimeFingerprint: session.codexRuntimeFingerprint ? String(session.codexRuntimeFingerprint) : null,
+    };
+  }
+  return {
+    runtimeId: session.claudeSessionId ? String(session.claudeSessionId) : null,
+    runtimeFingerprint: session.claudeRuntimeFingerprint ? String(session.claudeRuntimeFingerprint) : null,
+  };
+}
+
+function listRuntimeContextEntries(session, agent) {
+  const store = ensureRuntimeContextStore(session)[normalizeAgent(agent || session?.agent)] || {};
+  return Object.entries(store)
+    .map(([key, rawEntry]) => ({ key, entry: normalizeRuntimeContextEntry(rawEntry) }))
+    .filter((item) => item.entry)
+    .sort((a, b) => {
+      const aTs = itemTimestampMs(a.entry?.updatedAt);
+      const bTs = itemTimestampMs(b.entry?.updatedAt);
+      return bTs - aTs;
+    });
+}
+
+function itemTimestampMs(iso) {
+  const ms = iso ? Date.parse(iso) : 0;
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+function currentAgentRuntimeFingerprint(agent, options = {}) {
+  const normalizedAgent = normalizeAgent(agent);
+  if (normalizedAgent === 'codex') {
+    return getCodexRuntimeFingerprint(options.codexConfig);
+  }
+  return getClaudeRuntimeFingerprint(options.modelConfig);
+}
+
+function canAdoptLegacyRuntimeForCurrentChannel(agent, currentDescriptor, legacy, options = {}) {
+  if (!legacy?.runtimeId) return false;
+  const currentFingerprint = currentAgentRuntimeFingerprint(agent, options);
+  if (legacy.runtimeFingerprint && currentFingerprint) {
+    return runtimeFingerprintsCompatible(agent, legacy.runtimeFingerprint, currentFingerprint);
+  }
+  if (legacy.runtimeFingerprint) return false;
+  return currentDescriptor?.mode === 'local';
+}
+
+function buildLegacyRuntimeChannelDescriptor(session, agent, currentDescriptor, legacy) {
+  return {
+    mode: 'legacy',
+    legacy: true,
+    importedFrom: String(session?.importedFrom || ''),
+    runtimeIdHint: String(legacy?.runtimeId || ''),
+    runtimeFingerprintHint: String(legacy?.runtimeFingerprint || ''),
+    explicitModel: currentSessionModelOverride(session),
+    agent: normalizeAgent(agent),
+  };
+}
+
+function ensureLegacyRuntimeContextPreserved(session, agent, options = {}) {
+  if (!session) return;
+  const normalizedAgent = normalizeAgent(agent || session?.agent);
+  const legacy = getLegacyRuntimeMirror(session, normalizedAgent);
+  if (!legacy.runtimeId) return;
+  const existing = listRuntimeContextEntries(session, normalizedAgent)
+    .find((item) => item.entry?.runtimeId === legacy.runtimeId);
+  if (existing) return;
+
+  const store = ensureRuntimeContextStore(session)[normalizedAgent];
+  const currentDescriptor = buildRuntimeChannelDescriptor(session, normalizedAgent, options);
+  const useCurrentChannel = canAdoptLegacyRuntimeForCurrentChannel(normalizedAgent, currentDescriptor, legacy, options);
+  const descriptor = useCurrentChannel
+    ? currentDescriptor
+    : buildLegacyRuntimeChannelDescriptor(session, normalizedAgent, currentDescriptor, legacy);
+  const key = buildRuntimeChannelKey(normalizedAgent, descriptor);
+  const normalized = normalizeRuntimeContextEntry({
+    runtimeId: legacy.runtimeId,
+    runtimeFingerprint: legacy.runtimeFingerprint,
+    updatedAt: session.updated || session.created || new Date().toISOString(),
+    model: currentSessionModelOverride(session),
+    descriptor,
+    legacy: !useCurrentChannel,
+  });
+  if (normalized) {
+    store[key] = normalized;
+  }
+}
+
+function getRuntimeSessionState(session, options = {}) {
+  const normalizedAgent = normalizeAgent(options.agent || session?.agent);
+  if (!session) {
+    return {
+      agent: normalizedAgent,
+      key: options.channelKey || null,
+      descriptor: options.channelDescriptor || null,
+      entry: null,
+      store: null,
+    };
+  }
+
+  ensureRuntimeContextStore(session);
+  ensureLegacyRuntimeContextPreserved(session, normalizedAgent, options);
+
+  const descriptor = options.channelDescriptor || buildRuntimeChannelDescriptor(session, normalizedAgent, options);
+  const key = options.channelKey || buildRuntimeChannelKey(normalizedAgent, descriptor);
+  const store = ensureRuntimeContextStore(session)[normalizedAgent];
+  let entry = normalizeRuntimeContextEntry(store[key]);
+
+  if (!entry) {
+    const migrated = listRuntimeContextEntries(session, normalizedAgent)
+      .find((item) => item.key !== key && runtimeChannelDescriptorsCompatible(normalizedAgent, descriptor, item.entry?.descriptor || null));
+    if (migrated?.entry) {
+      entry = normalizeRuntimeContextEntry({
+        ...migrated.entry,
+        descriptor,
+        updatedAt: migrated.entry.updatedAt || session.updated || session.created || new Date().toISOString(),
+      });
+      if (entry) {
+        store[key] = entry;
+        delete store[migrated.key];
+      }
+    }
+  }
+
+  if (!entry && options.create) {
+    entry = normalizeRuntimeContextEntry({
+      runtimeId: null,
+      runtimeFingerprint: null,
+      updatedAt: session.updated || session.created || new Date().toISOString(),
+      model: currentSessionModelOverride(session),
+      descriptor,
+      legacy: false,
+    });
+  }
+
+  if (entry) {
+    if (!entry.descriptor) entry.descriptor = cloneJson(descriptor);
+    if (!entry.updatedAt) entry.updatedAt = session.updated || session.created || new Date().toISOString();
+    entry.model = currentSessionModelOverride(session);
+    store[key] = entry;
+  }
+
+  return {
+    agent: normalizedAgent,
+    key,
+    descriptor,
+    entry,
+    store,
+  };
+}
+
+function syncLegacyRuntimeMirror(session) {
+  if (!session || typeof session !== 'object') return;
+  const agent = getSessionAgent(session);
+  const state = getRuntimeSessionState(session, { agent });
+  if (agent === 'codex') {
+    session.codexThreadId = state.entry?.runtimeId || null;
+    session.codexRuntimeFingerprint = state.entry?.runtimeFingerprint || null;
+    session.claudeSessionId = null;
+    session.claudeRuntimeFingerprint = null;
+  } else {
+    session.claudeSessionId = state.entry?.runtimeId || null;
+    session.claudeRuntimeFingerprint = state.entry?.runtimeFingerprint || null;
+    session.codexThreadId = null;
+    session.codexRuntimeFingerprint = null;
+  }
+}
+
+function setRuntimeSessionState(session, updates = {}, options = {}) {
+  if (!session) return null;
+  const state = getRuntimeSessionState(session, { ...options, create: true });
+  if (!state.store) return null;
+  const nextEntry = {
+    ...(state.entry || {}),
+    runtimeId: Object.prototype.hasOwnProperty.call(updates, 'runtimeId')
+      ? (updates.runtimeId ? String(updates.runtimeId) : null)
+      : (state.entry?.runtimeId || null),
+    runtimeFingerprint: Object.prototype.hasOwnProperty.call(updates, 'runtimeFingerprint')
+      ? (updates.runtimeFingerprint ? String(updates.runtimeFingerprint) : null)
+      : (state.entry?.runtimeFingerprint || null),
+    updatedAt: new Date().toISOString(),
+    model: currentSessionModelOverride(session),
+    descriptor: cloneJson(updates.channelDescriptor || state.descriptor),
+    legacy: false,
+  };
+  const normalized = normalizeRuntimeContextEntry(nextEntry);
+  if (normalized) {
+    state.store[state.key] = normalized;
+  } else {
+    delete state.store[state.key];
+  }
+  syncLegacyRuntimeMirror(session);
+  return normalized;
+}
+
+function getRuntimeSessionId(session, options = {}) {
+  if (!session) return null;
+  const state = getRuntimeSessionState(session, options);
+  syncLegacyRuntimeMirror(session);
+  return state.entry?.runtimeId || null;
+}
+
+function getRuntimeSessionFingerprint(session, options = {}) {
+  if (!session) return null;
+  const state = getRuntimeSessionState(session, options);
+  return state.entry?.runtimeFingerprint || null;
+}
+
+function setRuntimeSessionId(session, runtimeId, options = {}) {
+  return setRuntimeSessionState(session, { runtimeId }, options);
+}
+
+function setRuntimeSessionFingerprint(session, runtimeFingerprint, options = {}) {
+  return setRuntimeSessionState(session, { runtimeFingerprint }, options);
+}
+
+function clearRuntimeSessionId(session, options = {}) {
+  if (!session) return;
+  const normalizedAgent = normalizeAgent(options.agent || session?.agent);
+  ensureRuntimeContextStore(session);
+  ensureLegacyRuntimeContextPreserved(session, normalizedAgent, options);
+  const clearAllChannels = options.allChannels !== false && !options.currentOnly;
+  if (clearAllChannels) {
+    session.runtimeContexts[normalizedAgent] = {};
+  } else {
+    const state = getRuntimeSessionState(session, options);
+    if (state.store && state.key) {
+      delete state.store[state.key];
+    }
+  }
+  syncLegacyRuntimeMirror(session);
+}
+
+function getFallbackRuntimeSessionState(session, options = {}) {
+  if (!session) return null;
+  const normalizedAgent = normalizeAgent(options.agent || session?.agent);
+  ensureLegacyRuntimeContextPreserved(session, normalizedAgent, options);
+  const currentState = getRuntimeSessionState(session, options);
+  const excludedKey = options.excludeChannelKey || currentState.key;
+  const fallback = listRuntimeContextEntries(session, normalizedAgent)
+    .find((item) => item.entry?.runtimeId && item.key !== excludedKey);
+  if (!fallback) return null;
+  return {
+    agent: normalizedAgent,
+    key: fallback.key,
+    descriptor: fallback.entry?.descriptor || null,
+    entry: fallback.entry,
+  };
+}
+
+function getAllRuntimeSessionIds(session, agent, options = {}) {
+  if (!session) return [];
+  const normalizedAgent = normalizeAgent(agent || session?.agent);
+  ensureLegacyRuntimeContextPreserved(session, normalizedAgent, options);
+  return Array.from(new Set(
+    listRuntimeContextEntries(session, normalizedAgent)
+      .map((item) => item.entry?.runtimeId || null)
+      .filter(Boolean)
+  ));
+}
+
+function sessionHasRuntimeId(session, agent, runtimeId, options = {}) {
+  if (!runtimeId) return false;
+  return getAllRuntimeSessionIds(session, agent, options).includes(String(runtimeId));
+}
+
+function getPreferredRuntimeSessionId(session, agent, options = {}) {
+  if (!session) return null;
+  const current = getRuntimeSessionId(session, { ...options, agent });
+  if (current) return current;
+  const fallback = getFallbackRuntimeSessionState(session, { ...options, agent });
+  return fallback?.entry?.runtimeId || null;
 }
 
 function normalizeSession(session) {
   if (!session || typeof session !== 'object') return session;
   session.agent = normalizeAgent(session.agent);
   if (!Object.prototype.hasOwnProperty.call(session, 'claudeSessionId')) session.claudeSessionId = null;
+  if (!Object.prototype.hasOwnProperty.call(session, 'claudeRuntimeFingerprint')) session.claudeRuntimeFingerprint = null;
   if (!Object.prototype.hasOwnProperty.call(session, 'codexThreadId')) session.codexThreadId = null;
+  if (!Object.prototype.hasOwnProperty.call(session, 'codexRuntimeFingerprint')) session.codexRuntimeFingerprint = null;
   if (!Object.prototype.hasOwnProperty.call(session, 'totalCost')) session.totalCost = 0;
   if (!Object.prototype.hasOwnProperty.call(session, 'projectId')) session.projectId = null;
   if (!Object.prototype.hasOwnProperty.call(session, 'totalUsage') || !session.totalUsage) {
@@ -1538,6 +2321,17 @@ function normalizeSession(session) {
       return message;
     });
   }
+  const runtimeContexts = ensureRuntimeContextStore(session);
+  for (const agentName of ['claude', 'codex']) {
+    const store = runtimeContexts[agentName];
+    for (const [key, rawEntry] of Object.entries(store)) {
+      const normalized = normalizeRuntimeContextEntry(rawEntry);
+      if (normalized) store[key] = normalized;
+      else delete store[key];
+    }
+  }
+  ensureLegacyRuntimeContextPreserved(session, session.agent);
+  syncLegacyRuntimeMirror(session);
   return session;
 }
 
@@ -1547,26 +2341,6 @@ function getSessionAgent(session) {
 
 function isClaudeSession(session) {
   return getSessionAgent(session) === 'claude';
-}
-
-function getRuntimeSessionId(session) {
-  if (!session) return null;
-  return getSessionAgent(session) === 'codex'
-    ? (session.codexThreadId || null)
-    : (session.claudeSessionId || null);
-}
-
-function setRuntimeSessionId(session, runtimeId) {
-  if (!session) return;
-  if (getSessionAgent(session) === 'codex') {
-    session.codexThreadId = runtimeId || null;
-  } else {
-    session.claudeSessionId = runtimeId || null;
-  }
-}
-
-function clearRuntimeSessionId(session) {
-  setRuntimeSessionId(session, null);
 }
 
 function loadSession(id) {
@@ -1604,6 +2378,18 @@ function modelShortName(fullModel) {
   const baseLower = baseModel.toLowerCase();
   const entry = Object.entries(MODEL_MAP).find(([, value]) => String(value || '').toLowerCase() === baseLower);
   return entry ? (isOneM ? `${entry[0]}[1m]` : entry[0]) : null;
+}
+
+function getClaudeModelMenuLabel(modelOrAlias) {
+  if (!modelOrAlias) return null;
+  const normalized = normalizeClaudeModelAliasInput(modelOrAlias);
+  const lower = normalized.toLowerCase();
+  if (lower === 'default') {
+    return CLAUDE_MODEL_MENU_ENTRIES.find((entry) => entry.alias === 'default')?.label || '默认';
+  }
+  const alias = modelShortName(normalized) || normalized;
+  const entry = CLAUDE_MODEL_MENU_ENTRIES.find((item) => item.alias.toLowerCase() === String(alias).toLowerCase());
+  return entry?.label || null;
 }
 
 function getClaudeModelMenuEntries() {
@@ -1662,6 +2448,59 @@ function sessionModelLabel(session) {
   return isClaudeSession(session) ? (modelShortName(session.model) || session.model) : session.model;
 }
 
+function getRuntimeContextCount(session, agent) {
+  return listRuntimeContextEntries(session, agent).filter((item) => item.entry?.runtimeId).length;
+}
+
+function formatRuntimeChannelLabel(agent, descriptor) {
+  const normalizedAgent = normalizeAgent(agent);
+  const mode = String(descriptor?.mode || 'local').toLowerCase();
+  if (normalizedAgent === 'claude') {
+    if (mode === 'custom') return descriptor?.templateName ? `Claude · ${descriptor.templateName}` : 'Claude · AI 提供商';
+    if (mode === 'legacy') return 'Claude · 旧线程';
+    return 'Claude · 本地配置';
+  }
+  if (mode === 'unified' || mode === 'custom') {
+    return descriptor?.sourceName ? `Codex · ${descriptor.sourceName}` : 'Codex · AI 提供商';
+  }
+  if (mode === 'legacy') return 'Codex · 旧线程';
+  if (mode === 'error') return 'Codex · 配置异常';
+  return 'Codex · 本地配置';
+}
+
+function buildActiveRuntimeSummary(session, options = {}) {
+  if (!session) return null;
+  const agent = normalizeAgent(options.agent || session.agent);
+  const state = getRuntimeSessionState(session, { ...options, agent });
+  const descriptor = state.descriptor || {};
+  const explicitModel = String(session?.model || '').trim();
+  const fallbackModel = String(descriptor.defaultModel || '').trim();
+  const summaryModel = explicitModel || fallbackModel || '';
+  const displayModel = sessionModelLabel(session) || summaryModel;
+  return {
+    agent,
+    channelKey: state.key || null,
+    channelLabel: formatRuntimeChannelLabel(agent, descriptor),
+    mode: String(descriptor.mode || 'local'),
+    model: summaryModel,
+    displayModel,
+    explicitModel,
+    defaultModel: fallbackModel,
+    runtimeIdPresent: !!state.entry?.runtimeId,
+    runtimeId: state.entry?.runtimeId || null,
+    runtimeCount: getRuntimeContextCount(session, agent),
+  };
+}
+
+function buildSessionRuntimeMeta(session, options = {}) {
+  const activeRuntime = buildActiveRuntimeSummary(session, options);
+  return {
+    activeChannelKey: activeRuntime?.channelKey || null,
+    activeRuntime,
+    runtimeCount: activeRuntime?.runtimeCount || 0,
+  };
+}
+
 function splitHistoryMessages(messages) {
   const list = Array.isArray(messages) ? messages : [];
   if (list.length <= INITIAL_HISTORY_COUNT) {
@@ -1675,6 +2514,352 @@ function splitHistoryMessages(messages) {
     olderChunks.push(older.slice(start, end));
   }
   return { recentMessages, olderChunks };
+}
+
+function normalizeReplayText(text) {
+  return String(text || '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function truncateReplayText(text, maxLen = CONTEXT_REPLAY_MESSAGE_CHAR_LIMIT) {
+  const normalized = normalizeReplayText(text);
+  if (!normalized || normalized.length <= maxLen) return normalized;
+  if (maxLen <= 24) return `${normalized.slice(0, Math.max(0, maxLen - 1))}…`;
+  const headLen = Math.ceil((maxLen - 1) * 0.62);
+  const tailLen = Math.max(8, maxLen - headLen - 1);
+  return `${normalized.slice(0, headLen)}…${normalized.slice(-tailLen)}`;
+}
+
+function pushUniqueCarryoverItem(list, seen, value, limit) {
+  const normalized = truncateReplayText(value, CONTEXT_REPLAY_FIELD_CHAR_LIMIT);
+  if (!normalized || seen.has(normalized)) return;
+  seen.add(normalized);
+  list.push(normalized);
+  if (typeof limit === 'number' && limit > 0 && list.length > limit) {
+    list.length = limit;
+  }
+}
+
+function messageTextForCarryover(message) {
+  if (!message || typeof message !== 'object') return '';
+  const parts = [];
+  const content = truncateReplayText(message.content || '', CONTEXT_REPLAY_MESSAGE_CHAR_LIMIT);
+  if (content) parts.push(content);
+  const attachments = Array.isArray(message.attachments) ? message.attachments : [];
+  if (attachments.length > 0) {
+    const names = attachments
+      .map((attachment) => String(attachment?.filename || attachment?.id || 'image').trim())
+      .filter(Boolean)
+      .slice(0, 4);
+    parts.push(`附件: ${names.join(', ')}${attachments.length > names.length ? ` 等 ${attachments.length} 项` : ''}`);
+  }
+  const toolCalls = Array.isArray(message.toolCalls) ? message.toolCalls : [];
+  if (toolCalls.length > 0) {
+    const names = toolCalls
+      .map((tool) => String(tool?.name || tool?.type || '').trim())
+      .filter(Boolean)
+      .slice(0, 4);
+    if (names.length > 0) {
+      parts.push(`工具: ${names.join(', ')}${toolCalls.length > names.length ? ` 等 ${toolCalls.length} 个` : ''}`);
+    }
+  }
+  return parts.join('\n');
+}
+
+function extractCarryoverLead(text) {
+  const normalized = normalizeReplayText(text);
+  if (!normalized) return '';
+  const lead = normalized
+    .split('\n')
+    .map((line) => line.trim())
+    .find(Boolean) || normalized;
+  return truncateReplayText(lead, CONTEXT_REPLAY_FIELD_CHAR_LIMIT);
+}
+
+function collectRecentCarryoverMessages(messages) {
+  const recent = Array.isArray(messages) ? messages.slice(-CONTEXT_REPLAY_RECENT_MESSAGE_LIMIT) : [];
+  const blocks = [];
+  let remaining = CONTEXT_REPLAY_RECENT_CHAR_BUDGET;
+  for (let index = recent.length - 1; index >= 0; index -= 1) {
+    const message = recent[index];
+    const role = message?.role === 'assistant' ? '助手' : '用户';
+    const baseText = messageTextForCarryover(message);
+    if (!baseText) continue;
+    const allowedBody = Math.max(140, Math.min(CONTEXT_REPLAY_MESSAGE_CHAR_LIMIT, remaining - 24));
+    const body = truncateReplayText(baseText, allowedBody);
+    if (!body) continue;
+    const block = `[${role}]\n${body}`;
+    blocks.unshift(block);
+    remaining -= block.length;
+    if (remaining <= 160) break;
+  }
+  return blocks;
+}
+
+function collectCompletedCarryoverItems(messages) {
+  const items = [];
+  const seen = new Set();
+  const list = Array.isArray(messages) ? messages.slice() : [];
+  for (let index = list.length - 1; index >= 0 && items.length < CONTEXT_REPLAY_MAX_COMPLETED_ITEMS; index -= 1) {
+    const message = list[index];
+    if (message?.role !== 'assistant') continue;
+    const summary = extractCarryoverLead(messageTextForCarryover(message));
+    if (summary) pushUniqueCarryoverItem(items, seen, summary, CONTEXT_REPLAY_MAX_COMPLETED_ITEMS);
+  }
+  return items;
+}
+
+function collectConstraintCarryoverItems(messages) {
+  const items = [];
+  const seen = new Set();
+  const list = Array.isArray(messages) ? messages : [];
+  const matcher = /不要|别|请勿|必须|不能|不可|优先|务必|默认|保留|切换|resume|线程|上下文|配置|路径|模型|报错|配置项/i;
+  for (let index = list.length - 1; index >= 0 && items.length < CONTEXT_REPLAY_MAX_CONSTRAINT_ITEMS; index -= 1) {
+    const message = list[index];
+    if (message?.role !== 'user') continue;
+    const text = normalizeReplayText(messageTextForCarryover(message));
+    if (!text) continue;
+    for (const line of text.split('\n')) {
+      if (!matcher.test(line)) continue;
+      pushUniqueCarryoverItem(items, seen, line, CONTEXT_REPLAY_MAX_CONSTRAINT_ITEMS);
+      if (items.length >= CONTEXT_REPLAY_MAX_CONSTRAINT_ITEMS) break;
+    }
+  }
+  return items;
+}
+
+function buildClaudeCarryoverConfigLines(session) {
+  const lines = [];
+  const config = loadModelConfig();
+  const template = getClaudeSelectedTemplate(config);
+  if (template) {
+    lines.push(`Claude 当前运行配置: provider (${template.name})`);
+    if (template.apiBase) lines.push(`Claude API Base: ${template.apiBase}`);
+    if (template.defaultModel) lines.push(`Claude 默认模型: ${template.defaultModel}`);
+    if (template.upstreamType) lines.push(`Claude 上游类型: ${template.upstreamType}`);
+  } else {
+    const localCreds = readClaudeSettingsCredentials();
+    lines.push('Claude 当前运行配置: local');
+    lines.push('Claude 本地配置文件: ~/.claude/settings.json');
+    if (localCreds?.apiBase) lines.push(`Claude 本地 API Base: ${localCreds.apiBase}`);
+    if (localCreds?.defaultModel) lines.push(`Claude 本地默认模型: ${localCreds.defaultModel}`);
+  }
+  if (session?.model) lines.push(`当前会话模型覆盖: ${session.model}`);
+  lines.push(`当前权限模式: ${session?.permissionMode || 'yolo'}`);
+  if (session?.cwd) lines.push(`当前工作目录: ${session.cwd}`);
+  return lines;
+}
+
+function buildCodexCarryoverConfigLines(session) {
+  const lines = [];
+  const config = loadCodexConfig();
+  if (normalizeCodexMode(config.mode) === 'local') {
+    lines.push('Codex 当前运行配置: local');
+    lines.push('Codex 本地配置文件: ~/.codex/config.toml');
+    lines.push('Codex 本地鉴权文件: ~/.codex/auth.json');
+  } else {
+    const source = resolveCodexActiveSource(config);
+    if (source?.error) {
+      lines.push(`Codex 当前运行配置异常: ${source.error}`);
+    } else {
+      lines.push(`Codex 当前运行配置: ${source?.mode || 'unified'}${source?.name ? ` (${source.name})` : ''}`);
+      if (source?.apiBase) lines.push(`Codex API Base: ${source.apiBase}`);
+      if (source?.defaultModel) lines.push(`Codex 默认模型: ${source.defaultModel}`);
+    }
+    if (config.activeProfile) lines.push(`Codex 激活配置: ${config.activeProfile}`);
+    if (config.sharedTemplate) lines.push(`Codex AI 提供商: ${config.sharedTemplate}`);
+  }
+  if (session?.model) lines.push(`当前会话模型覆盖: ${session.model}`);
+  lines.push(`当前权限模式: ${session?.permissionMode || 'yolo'}`);
+  if (session?.cwd) lines.push(`当前工作目录: ${session.cwd}`);
+  return lines;
+}
+
+function buildCarryoverConfigLines(session) {
+  return isClaudeSession(session)
+    ? buildClaudeCarryoverConfigLines(session)
+    : buildCodexCarryoverConfigLines(session);
+}
+
+function collectCarryoverExactLines(messages, currentInputText, configLines) {
+  const buckets = {
+    paths: [],
+    models: [],
+    configs: [],
+    errors: [],
+  };
+  const seen = {
+    paths: new Set(),
+    models: new Set(),
+    configs: new Set(),
+    errors: new Set(),
+  };
+  const pathRegex = /(?:~\/|\/)[^\s"'`<>|]+/g;
+  const modelRegexes = [
+    /\bclaude-[a-zA-Z0-9._-]+\b/g,
+    /\bgpt-[a-zA-Z0-9._-]+\b/g,
+    /\b(?:opus|sonnet|haiku)(?:\[1m\])?\b/g,
+  ];
+  const configRegex = /\b(?:ANTHROPIC_[A-Z0-9_]+|OPENAI_[A-Z0-9_]+|model_provider|preferred_auth_method|base_url|apiBase|apiKey|defaultModel|sharedTemplate|activeTemplate|activeProfile|legacyMode|permissionMode)\b/g;
+  const errorLineRegex = /error|failed|failure|失败|报错|超时|not found|invalid|forbidden|exceed|context|退出码/i;
+  const sources = [];
+  for (const message of Array.isArray(messages) ? messages : []) {
+    const text = messageTextForCarryover(message);
+    if (text) sources.push(text);
+  }
+  if (currentInputText) sources.push(String(currentInputText));
+  for (const line of Array.isArray(configLines) ? configLines : []) {
+    if (line) sources.push(String(line));
+  }
+
+  for (const source of sources) {
+    const text = normalizeReplayText(source);
+    if (!text) continue;
+    const pathMatches = text.match(pathRegex) || [];
+    for (const match of pathMatches) {
+      pushUniqueCarryoverItem(buckets.paths, seen.paths, match, CONTEXT_REPLAY_MAX_EXACT_ITEMS);
+    }
+    for (const regex of modelRegexes) {
+      const matches = text.match(regex) || [];
+      for (const match of matches) {
+        pushUniqueCarryoverItem(buckets.models, seen.models, match, CONTEXT_REPLAY_MAX_EXACT_ITEMS);
+      }
+    }
+    const configMatches = text.match(configRegex) || [];
+    for (const match of configMatches) {
+      pushUniqueCarryoverItem(buckets.configs, seen.configs, match, CONTEXT_REPLAY_MAX_EXACT_ITEMS);
+    }
+    for (const line of text.split('\n')) {
+      if (!errorLineRegex.test(line)) continue;
+      pushUniqueCarryoverItem(buckets.errors, seen.errors, line, CONTEXT_REPLAY_MAX_EXACT_ITEMS);
+    }
+  }
+
+  const lines = [];
+  if (buckets.paths.length > 0) lines.push(`- 路径/文件: ${buckets.paths.join(' | ')}`);
+  if (buckets.models.length > 0) lines.push(`- 模型名: ${buckets.models.join(' | ')}`);
+  if (buckets.configs.length > 0) lines.push(`- 配置项: ${buckets.configs.join(' | ')}`);
+  if (buckets.errors.length > 0) lines.push(`- 报错/异常: ${buckets.errors.join(' | ')}`);
+  return lines;
+}
+
+function buildCarryoverSummary(session, historyMessages, currentInputText, attachments) {
+  const recentUser = [...(Array.isArray(historyMessages) ? historyMessages : [])]
+    .reverse()
+    .find((message) => message?.role === 'user' && messageTextForCarryover(message));
+  const goal = extractCarryoverLead(recentUser ? messageTextForCarryover(recentUser) : currentInputText)
+    || '继续当前会话中的最近任务';
+  const pending = extractCarryoverLead(currentInputText)
+    || (Array.isArray(attachments) && attachments.length > 0
+      ? `继续处理本次新增的 ${attachments.length} 张图片相关请求`
+      : '继续处理当前会话的下一步任务');
+  const configLines = buildCarryoverConfigLines(session);
+  const historyChars = (Array.isArray(historyMessages) ? historyMessages : [])
+    .reduce((sum, message) => sum + messageTextForCarryover(message).length, 0);
+  const detailed = (Array.isArray(historyMessages) ? historyMessages.length : 0) >= CONTEXT_REPLAY_MIN_DETAILED_SUMMARY_MESSAGES
+    || historyChars >= CONTEXT_REPLAY_MIN_DETAILED_SUMMARY_CHARS;
+
+  const lines = [];
+  lines.push(`当前目标: ${goal}`);
+  if (detailed) {
+    const completed = collectCompletedCarryoverItems(historyMessages);
+    if (completed.length > 0) {
+      lines.push('已完成操作:');
+      for (const item of completed) lines.push(`- ${item}`);
+    }
+    const constraints = collectConstraintCarryoverItems(historyMessages);
+    if (constraints.length > 0) {
+      lines.push('关键约束:');
+      for (const item of constraints) lines.push(`- ${item}`);
+    }
+  }
+  if (configLines.length > 0) {
+    lines.push('关键配置状态:');
+    for (const item of configLines) lines.push(`- ${truncateReplayText(item, CONTEXT_REPLAY_FIELD_CHAR_LIMIT)}`);
+  }
+  lines.push(`当前待解决问题: ${pending}`);
+  if (detailed) {
+    const exactLines = collectCarryoverExactLines(historyMessages, currentInputText, configLines);
+    if (exactLines.length > 0) {
+      lines.push('必须精确保留的原文:');
+      for (const item of exactLines) lines.push(item);
+    }
+  }
+
+  let text = lines.join('\n');
+  if (text.length > CONTEXT_REPLAY_SUMMARY_MAX_CHARS) {
+    text = `${text.slice(0, CONTEXT_REPLAY_SUMMARY_MAX_CHARS - 12).trimEnd()}\n[摘要已截断]`;
+  }
+  return {
+    text,
+    detailed,
+    configLines,
+  };
+}
+
+function formatCurrentInputForCarryover(text, attachments) {
+  const blocks = [];
+  const normalized = normalizeReplayText(text);
+  if (normalized) blocks.push(normalized);
+  const list = Array.isArray(attachments) ? attachments : [];
+  if (list.length > 0) {
+    const names = list
+      .map((attachment) => String(attachment?.filename || attachment?.id || 'image').trim())
+      .filter(Boolean)
+      .slice(0, 4);
+    blocks.push(`本次还附带图片: ${names.join(', ')}${list.length > names.length ? ` 等 ${list.length} 项` : ''}`);
+  }
+  if (blocks.length === 0) {
+    blocks.push('请继续处理当前会话中的下一步任务。');
+  }
+  return blocks.join('\n');
+}
+
+function buildThreadCarryoverPayload(session, text, attachments, historyMessages, threadReset) {
+  const history = Array.isArray(historyMessages) ? historyMessages.filter(Boolean) : [];
+  if (history.length === 0) return null;
+  const recentBlocks = collectRecentCarryoverMessages(history);
+  if (recentBlocks.length === 0) return null;
+  const summary = buildCarryoverSummary(session, history, text, attachments);
+  let reasonText = '检测到配置已经变化，当前必须按最新配置重建底层线程。';
+  if (threadReset?.reason === 'legacy_runtime') {
+    reasonText = '检测到这是旧版线程，当前必须按最新配置重建底层线程。';
+  } else if (threadReset?.reason === 'channel_changed') {
+    reasonText = '检测到当前会话切换到了新的渠道或模型，当前会在该渠道下建立新线程。';
+  }
+  const prompt = [
+    '[webcoding 自动上下文续接]',
+    reasonText,
+    '下面依次提供结构化上下文摘要、最近几轮原始消息，以及本次用户新输入。',
+    '请先吸收这些内容，不要逐段复述，不要把它们当成需要原样回复给用户的正文；直接继续处理当前任务。',
+    '',
+    '[结构化上下文摘要]',
+    summary.text,
+    '',
+    '[最近对话原文]',
+    recentBlocks.join('\n\n'),
+    '',
+    '[本次用户新输入]',
+    formatCurrentInputForCarryover(text, attachments),
+  ].join('\n');
+  return {
+    prompt,
+    summaryDetailed: summary.detailed,
+    recentCount: recentBlocks.length,
+    historyCount: history.length,
+  };
+}
+
+function buildThreadCarryoverNotice(carryover) {
+  if (!carryover) {
+    return '已新开线程；历史较少，本次仅发送当前输入。';
+  }
+  return carryover.summaryDetailed
+    ? `已新开线程，并补充摘要和最近 ${carryover.recentCount} 条消息。`
+    : `已新开线程，并补充轻量摘要和最近 ${carryover.recentCount} 条消息。`;
 }
 
 function sendHistoryChunks(ws, sessionId, chunks, index = 0) {
@@ -1726,14 +2911,119 @@ function readBridgeState() {
   try {
     if (!fs.existsSync(BRIDGE_STATE_PATH)) return null;
     const parsed = JSON.parse(fs.readFileSync(BRIDGE_STATE_PATH, 'utf8'));
-    return parsed && typeof parsed.port === 'number' && parsed.port > 0 ? parsed : null;
+    if (!parsed || typeof parsed.port !== 'number' || parsed.port <= 0) return null;
+    return {
+      ...parsed,
+      scriptFingerprint: String(parsed.scriptFingerprint || '').trim(),
+    };
   } catch {
     return null;
   }
 }
 
-function loadBridgeRuntime() {
-  return readCachedJsonConfig(BRIDGE_RUNTIME_PATH) || null;
+function normalizeBridgeRuntimeUpstream(upstream) {
+  if (!upstream || typeof upstream !== 'object') return null;
+  const apiKey = String(upstream.apiKey || '');
+  const apiBase = String(upstream.apiBase || '').trim();
+  if (!apiKey || !apiBase) return null;
+  return {
+    name: String(upstream.name || '').trim() || 'AI Provider',
+    apiKey,
+    apiBase,
+    kind: upstream.kind === 'anthropic' ? 'anthropic' : 'openai',
+    defaultModel: String(upstream.defaultModel || '').trim(),
+  };
+}
+
+function normalizeBridgeRuntimeStore(raw) {
+  const runtimes = {};
+  const addEntry = (tokenValue, upstreamValue, updatedAtValue = null) => {
+    const token = String(tokenValue || '').trim();
+    const upstream = normalizeBridgeRuntimeUpstream(upstreamValue);
+    if (!token || !upstream) return;
+    runtimes[token] = {
+      token,
+      upstream,
+      updatedAt: updatedAtValue ? String(updatedAtValue).trim() : null,
+    };
+  };
+
+  if (raw && typeof raw === 'object' && raw.runtimes && typeof raw.runtimes === 'object' && !Array.isArray(raw.runtimes)) {
+    for (const [token, value] of Object.entries(raw.runtimes)) {
+      if (value && typeof value === 'object' && value.upstream) {
+        addEntry(value.token || token, value.upstream, value.updatedAt || raw.updatedAt || null);
+      } else {
+        addEntry(token, value, raw.updatedAt || null);
+      }
+    }
+  }
+  if (!Object.keys(runtimes).length) {
+    addEntry(raw?.token, raw?.upstream, raw?.updatedAt || null);
+  }
+
+  const preferredToken = String(raw?.token || '').trim();
+  const token = preferredToken && runtimes[preferredToken]
+    ? preferredToken
+    : (Object.keys(runtimes)[0] || '');
+  const current = token ? runtimes[token] : null;
+
+  return {
+    version: 2,
+    token,
+    upstream: current ? cloneJson(current.upstream) : null,
+    updatedAt: current?.updatedAt || null,
+    runtimes,
+  };
+}
+
+function loadBridgeRuntimeStore() {
+  return normalizeBridgeRuntimeStore(readCachedJsonConfig(BRIDGE_RUNTIME_PATH));
+}
+
+function saveBridgeRuntimeStore(store) {
+  const normalized = normalizeBridgeRuntimeStore(store);
+  writeCachedJsonConfig(BRIDGE_RUNTIME_PATH, {
+    version: normalized.version,
+    token: normalized.token || '',
+    upstream: normalized.upstream ? cloneJson(normalized.upstream) : null,
+    updatedAt: normalized.updatedAt || null,
+    runtimes: normalized.runtimes,
+  });
+}
+
+function loadBridgeRuntime(token = '') {
+  const store = loadBridgeRuntimeStore();
+  const requestedToken = String(token || store.token || '').trim();
+  const entry = (requestedToken && store.runtimes[requestedToken])
+    || (store.token && store.runtimes[store.token])
+    || Object.values(store.runtimes)[0]
+    || null;
+  if (!entry) return null;
+  return {
+    token: entry.token,
+    upstream: cloneJson(entry.upstream),
+    updatedAt: entry.updatedAt || null,
+  };
+}
+
+function listBridgeRuntimeTokens() {
+  return Object.keys(loadBridgeRuntimeStore().runtimes);
+}
+
+function getBridgeScriptFingerprint() {
+  try {
+    const stat = fs.statSync(BRIDGE_SCRIPT_PATH);
+    return `${stat.size}:${Math.trunc(stat.mtimeMs)}`;
+  } catch {
+    return '';
+  }
+}
+
+function canReuseBridgeState(state) {
+  if (!state?.pid || !state.port || !isProcessRunning(state.pid)) return false;
+  const currentFingerprint = getBridgeScriptFingerprint();
+  if (!currentFingerprint) return true;
+  return !!state.scriptFingerprint && state.scriptFingerprint === currentFingerprint;
 }
 
 function buildLocalBridgeBaseUrl(port, kind) {
@@ -1741,9 +3031,7 @@ function buildLocalBridgeBaseUrl(port, kind) {
 }
 
 function getActiveUnifiedTemplate() {
-  const config = loadModelConfig();
-  if (config.mode !== 'custom' || !config.activeTemplate) return null;
-  const tpl = (config.templates || []).find((item) => item.name === config.activeTemplate) || null;
+  const tpl = getClaudeSelectedTemplate(loadModelConfig());
   if (!tpl || !tpl.apiKey || !tpl.apiBase) return null;
   return tpl;
 }
@@ -1762,8 +3050,12 @@ function isBridgePortReachable(port) {
 
 function ensureLocalBridgeRunning() {
   const existing = readBridgeState();
-  if (existing?.pid && isProcessRunning(existing.pid) && existing.port) {
+  if (canReuseBridgeState(existing)) {
     return existing;
+  }
+  if (existing?.pid && isProcessRunning(existing.pid)) {
+    killProcess(existing.pid, true);
+    sleepSync(100);
   }
 
   const child = spawn(process.execPath, [BRIDGE_SCRIPT_PATH], {
@@ -1789,19 +3081,25 @@ function ensureLocalBridgeRunning() {
 function ensureBridgeRuntimeForTemplate(tpl) {
   const defaultModel = String(tpl.defaultModel || '').trim();
   const upstreamType = tpl.upstreamType === 'anthropic' ? 'anthropic' : 'openai';
-  const existing = loadBridgeRuntime();
+  const store = loadBridgeRuntimeStore();
+  const existing = Object.values(store.runtimes).find((entry) => entry?.upstream?.name === String(tpl.name || '').trim()) || null;
   const token = existing?.token || crypto.randomBytes(24).toString('hex');
-  writeCachedJsonConfig(BRIDGE_RUNTIME_PATH, {
+  const updatedAt = new Date().toISOString();
+  store.runtimes[token] = {
     token,
     upstream: {
-      name: String(tpl.name || '').trim() || 'Unified API',
+      name: String(tpl.name || '').trim() || 'AI Provider',
       apiKey: String(tpl.apiKey || ''),
       apiBase: String(tpl.apiBase || '').trim(),
       kind: upstreamType,
       defaultModel,
     },
-    updatedAt: new Date().toISOString(),
-  });
+    updatedAt,
+  };
+  store.token = token;
+  store.upstream = cloneJson(store.runtimes[token].upstream);
+  store.updatedAt = updatedAt;
+  saveBridgeRuntimeStore(store);
   const state = ensureLocalBridgeRunning();
   return {
     token,
@@ -1824,8 +3122,11 @@ function collectSessionListSnapshot() {
   for (const f of files) {
     try {
       const s = normalizeSession(JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, f), 'utf8')));
-      const localMeta = getSessionAgent(s) === 'claude' && s.claudeSessionId && (!s.cwd || !s.importedFrom)
-        ? resolveClaudeSessionLocalMeta(s.claudeSessionId)
+      const preferredClaudeRuntimeId = getSessionAgent(s) === 'claude'
+        ? getPreferredRuntimeSessionId(s, 'claude')
+        : null;
+      const localMeta = getSessionAgent(s) === 'claude' && preferredClaudeRuntimeId && (!s.cwd || !s.importedFrom)
+        ? resolveClaudeSessionLocalMeta(preferredClaudeRuntimeId)
         : null;
       sessions.push({
         id: s.id,
@@ -1977,7 +3278,7 @@ function formatRuntimeError(agent, raw, context = {}) {
       return '找不到 Codex CLI。请检查 Codex 设置里的 CLI 路径，或确认系统 PATH 中可直接运行 `codex`。';
     }
     if (/unexpected argument|unexpected option|Usage:\s*codex/i.test(raw || '')) {
-      return `Codex CLI 参数不兼容：${firstMeaningfulLine(condensed)}。建议检查当前 CLI 版本与 cc-web 的参数约定是否匹配。`;
+      return `Codex CLI 参数不兼容：${firstMeaningfulLine(condensed)}。建议检查当前 CLI 版本与 webcoding 的参数约定是否匹配。`;
     }
     if (/permission denied|EACCES|EPERM/i.test(condensed)) {
       return 'Codex CLI 启动失败：当前环境没有足够权限执行该命令或访问目标目录。';
@@ -2000,8 +3301,8 @@ function formatRuntimeError(agent, raw, context = {}) {
   if (/ENOENT|not found|No such file/i.test(condensed)) {
     return '找不到 Claude CLI。请检查当前环境是否能直接运行 `claude`。';
   }
-  if (/authentication|unauthorized|forbidden|api key|credential/i.test(condensed)) {
-    return 'Claude 鉴权失败。请确认本机 Claude CLI 已完成登录，且凭据仍然有效。';
+  if (/authentication|unauthorized|forbidden|not logged in|\/login|login|api key|credential/i.test(condensed)) {
+    return 'Claude 本地认证不可用。请检查本机 Claude CLI 当前是账号登录态还是本地自定义 API 配置，并确认对应凭据仍然有效。';
   }
   return `Claude 任务失败${exitInfo}：${condensed}`;
 }
@@ -2180,7 +3481,7 @@ function handleDisconnectedProcessCompletion(sessionId, entry) {
   const cost = entry.lastCost !== null && entry.lastCost !== undefined ? `$${entry.lastCost.toFixed(4)}` : '';
   const respLen = (entry.fullText || '').length;
   sendNotification(
-    'CC-Web 任务完成',
+    'webcoding 任务完成',
     `会话: ${title}\n字数: ${respLen}\n费用: ${cost}`
   );
 }
@@ -2241,6 +3542,7 @@ function handleProcessComplete(sessionId, exitCode, signal) {
 // Global PID monitor: detect process completion (especially after server restart)
 setInterval(() => {
   for (const [sessionId, entry] of activeProcesses) {
+    if (entry.pendingProcessComplete) continue;
     if (entry.pid && !isProcessRunning(entry.pid)) {
       plog('INFO', 'pid_monitor_detected_exit', {
         sessionId: sessionId.slice(0, 8),
@@ -2435,6 +3737,20 @@ const server = http.createServer((req, res) => {
   if (!isPathInside(filePath, PUBLIC_ROOT)) {
     writeHeadWithSecurity(res, 403, { 'Content-Type': 'text/plain; charset=utf-8' });
     return res.end('Forbidden');
+  }
+
+  if (url.pathname === '/' || url.pathname === '/index.html') {
+    try {
+      const html = renderIndexHtml();
+      writeHeadWithSecurity(res, 200, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-cache',
+      });
+      return res.end(html);
+    } catch {
+      writeHeadWithSecurity(res, 500, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end('Internal Server Error');
+    }
   }
 
   fs.readFile(filePath, (err, data) => {
@@ -2689,7 +4005,7 @@ function handleTestNotify(ws) {
   if (!config.provider || config.provider === 'off') {
     return wsSend(ws, { type: 'notify_test_result', success: false, message: '通知已关闭，无法测试' });
   }
-  sendNotification('CC-Web 测试通知', '这是一条测试消息，如果你收到了说明通知配置正确！').then((result) => {
+  sendNotification('webcoding 测试通知', '这是一条测试消息，如果你收到了说明通知配置正确！').then((result) => {
     wsSend(ws, { type: 'notify_test_result', success: result.ok, message: result.ok ? '测试消息已发送，请检查是否收到' : `发送失败: ${result.error || result.body || '未知错误'}` });
   });
 }
@@ -2745,6 +4061,9 @@ function handleSaveModelConfig(ws, newConfig) {
     return wsSend(ws, { type: 'error', message: '无效的模型配置' });
   }
   const current = loadModelConfig();
+  const previousTemplate = current.mode === 'custom' && current.activeTemplate
+    ? (Array.isArray(current.templates) ? current.templates.find((item) => item.name === current.activeTemplate) : null)
+    : null;
   const merged = {
     mode: newConfig.mode,
     activeTemplate: newConfig.activeTemplate || '',
@@ -2769,6 +4088,12 @@ function handleSaveModelConfig(ws, newConfig) {
       haikuModel: nt.haikuModel || '',
     });
   }
+  if (merged.mode === 'custom' && !selectTemplateByName(merged.templates, merged.activeTemplate)) {
+    merged.activeTemplate = merged.templates[0]?.name || '';
+  }
+  if (merged.mode === 'local') {
+    merged.activeTemplate = '';
+  }
 
   saveModelConfig(merged);
 
@@ -2780,8 +4105,9 @@ function handleSaveModelConfig(ws, newConfig) {
     const tpl = merged.templates.find(t => t.name === merged.activeTemplate);
     if (tpl) applyCustomTemplateToSettings(tpl);
   } else {
-    clearManagedClaudeSettings();
+    restoreManagedClaudeSettings(previousTemplate);
   }
+  refreshCodexGeneratedRuntimeSnapshot('codex_runtime_refresh_after_model_save');
   plog('INFO', 'model_config_saved', { mode: merged.mode, activeTemplate: merged.activeTemplate });
   wsSend(ws, { type: 'model_config', config: getModelConfigMasked() });
   wsSend(ws, { type: 'system_message', message: '模型配置已保存' });
@@ -2830,7 +4156,15 @@ function handleSaveCodexConfig(ws, newConfig) {
     const templates = Array.isArray(modelConfig.templates) ? modelConfig.templates : [];
     merged.sharedTemplate = modelConfig.activeTemplate || templates[0]?.name || '';
   }
+  if (merged.mode === 'unified') {
+    const modelConfig = loadModelConfig();
+    const template = getCodexSelectedTemplate(merged, modelConfig);
+    merged.sharedTemplate = template?.name || '';
+  } else {
+    merged.sharedTemplate = '';
+  }
   saveCodexConfig(merged);
+  refreshCodexGeneratedRuntimeSnapshot('codex_runtime_refresh_after_codex_save');
   plog('INFO', 'codex_config_saved', {
     mode: merged.mode,
     legacyMode: merged.legacyMode || null,
@@ -2844,7 +4178,7 @@ function handleSaveCodexConfig(ws, newConfig) {
   wsSend(ws, {
     type: 'system_message',
     message: requestedSearch
-      ? 'Codex 配置已保存。当前 cc-web 的 Codex exec 路径暂未接入 Web Search，已自动忽略该开关。'
+      ? 'Codex 配置已保存。当前 webcoding 的 Codex exec 路径暂未接入 Web Search，已自动忽略该开关。'
       : 'Codex 配置已保存',
   });
 }
@@ -2860,7 +4194,7 @@ function handleFetchModels(ws, msg) {
   const base = String(apiBase || '').trim().replace(/\/+$/, '');
   let fullUrl = '';
   try {
-    const spec = buildModelsRequestSpec(base, apiKey, upstreamType, agent);
+    const spec = buildModelsRequestSpec(base, apiKey, upstreamType);
     fullUrl = spec.fullUrl;
   } catch (error) {
     return wsSend(ws, { type: 'fetch_models_result', success: false, message: error.message || '无效的 API Base URL' });
@@ -2913,7 +4247,7 @@ function handleFetchModels(ws, msg) {
   const mod = parsed.protocol === 'https:' ? require('https') : require('http');
   const reqOptions = {
     method: 'GET',
-    headers: buildModelsRequestSpec(base, realKey, upstreamType, agent).headers,
+    headers: buildModelsRequestSpec(base, realKey, upstreamType).headers,
     timeout: 15000,
   };
 
@@ -2998,6 +4332,7 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
           cwd: session.cwd || null,
           totalCost: session.totalCost || 0,
           totalUsage: session.totalUsage || null,
+          ...buildSessionRuntimeMeta(session),
         });
       }
       wsSend(ws, { type: 'system_message', message: '会话已清除，上下文已重置。' });
@@ -3017,7 +4352,7 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
               agent: 'codex',
               entries: [{
                 value: 'default',
-                label: 'Default',
+                label: '默认模型（Codex）',
                 desc: '使用当前 Codex 默认模型',
               }],
               current: session?.model || 'default',
@@ -3032,11 +4367,15 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
             session.updated = new Date().toISOString();
             saveSession(session);
           }
-          wsSend(ws, { type: 'model_changed', model: normalizedInput === 'default' ? '' : modelInput });
+          wsSend(ws, {
+            type: 'model_changed',
+            model: normalizedInput === 'default' ? '' : modelInput,
+            ...(session ? buildSessionRuntimeMeta(session) : {}),
+          });
           wsSend(ws, {
             type: 'system_message',
             message: normalizedInput === 'default'
-              ? 'Codex 模型已切换为: Default (使用当前配置默认模型)'
+              ? 'Codex 模型已切换为: 默认模型（Codex，跟随当前配置）'
               : `Codex 模型已切换为: ${modelInput}`,
           });
         }
@@ -3067,8 +4406,12 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
             session.updated = new Date().toISOString();
             saveSession(session);
           }
-          wsSend(ws, { type: 'model_changed', model: '' });
-          wsSend(ws, { type: 'system_message', message: '模型已切换为: Default (使用 CLI 默认模型)' });
+          wsSend(ws, {
+            type: 'model_changed',
+            model: '',
+            ...(session ? buildSessionRuntimeMeta(session) : {}),
+          });
+          wsSend(ws, { type: 'system_message', message: '模型已切换为: 默认（使用 CLI 默认模型）' });
           break;
         }
 
@@ -3077,8 +4420,12 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
           session.updated = new Date().toISOString();
           saveSession(session);
         }
-        const displayName = modelShortName(resolvedModel) || resolvedModel;
-        wsSend(ws, { type: 'model_changed', model: resolvedAlias });
+        const displayName = getClaudeModelMenuLabel(resolvedModel) || getClaudeModelMenuLabel(resolvedAlias) || modelShortName(resolvedModel) || resolvedModel;
+        wsSend(ws, {
+          type: 'model_changed',
+          model: resolvedAlias,
+          ...(session ? buildSessionRuntimeMeta(session) : {}),
+        });
         wsSend(ws, { type: 'system_message', message: `模型已切换为: ${displayName} (${resolvedModel})` });
       }
       break;
@@ -3190,6 +4537,8 @@ function handleNewSession(ws, msg) {
     agent,
     claudeSessionId: null,
     codexThreadId: null,
+    codexRuntimeFingerprint: null,
+    runtimeContexts: { claude: {}, codex: {} },
     model: null,
     permissionMode: requestedMode,
     totalCost: 0,
@@ -3216,6 +4565,7 @@ function handleNewSession(ws, msg) {
     hasUnread: false,
     historyPending: false,
     isRunning: false,
+    ...buildSessionRuntimeMeta(session),
   });
   sendSessionList(ws);
 }
@@ -3225,8 +4575,11 @@ function handleLoadSession(ws, sessionId) {
   if (!session) {
     return wsSend(ws, { type: 'error', message: 'Session not found' });
   }
-  if (getSessionAgent(session) === 'claude' && !session.cwd && session.claudeSessionId) {
-    const localMeta = resolveClaudeSessionLocalMeta(session.claudeSessionId);
+  const preferredClaudeRuntimeId = getSessionAgent(session) === 'claude'
+    ? getPreferredRuntimeSessionId(session, 'claude')
+    : null;
+  if (getSessionAgent(session) === 'claude' && !session.cwd && preferredClaudeRuntimeId) {
+    const localMeta = resolveClaudeSessionLocalMeta(preferredClaudeRuntimeId);
     if (localMeta?.cwd) {
       session.cwd = localMeta.cwd;
       if (!session.importedFrom && localMeta.projectDir) session.importedFrom = localMeta.projectDir;
@@ -3268,6 +4621,7 @@ function handleLoadSession(ws, sessionId) {
     historyPending: olderChunks.length > 0,
     updated: session.updated,
     isRunning: activeProcesses.has(sessionId),
+    ...buildSessionRuntimeMeta(session),
   });
 
   if (olderChunks.length > 0) {
@@ -3310,14 +4664,13 @@ function deleteClaudeLocalSession(claudeSessionId) {
   } catch {}
 }
 
-async function deleteCodexLocalSession(session) {
-  const threadId = session?.codexThreadId;
+async function deleteCodexLocalSession(threadId, importedRolloutPath = null) {
   if (!threadId || !/^[a-zA-Z0-9\-]+$/.test(String(threadId))) {
     return { removedFiles: 0, removedDbRows: false };
   }
 
   const rolloutPaths = new Set();
-  if (session.importedRolloutPath) rolloutPaths.add(path.resolve(session.importedRolloutPath));
+  if (importedRolloutPath) rolloutPaths.add(path.resolve(importedRolloutPath));
   try {
     for (const filePath of getCodexRolloutFiles()) {
       if (filePath.includes(threadId)) rolloutPaths.add(path.resolve(filePath));
@@ -3382,22 +4735,30 @@ function handleDeleteSession(ws, sessionId) {
     }
     invalidateSessionListCache();
     if (sessionAgent === 'codex') {
-      deleteCodexLocalSession(session).then((result) => {
-        plog('INFO', 'codex_local_session_deleted', {
-          sessionId: sessionId.slice(0, 8),
-          threadId: session?.codexThreadId || null,
-          removedFiles: result.removedFiles,
-          removedDbRows: result.removedDbRows,
-        });
+      const codexThreadIds = getAllRuntimeSessionIds(session, 'codex');
+      Promise.all(codexThreadIds.map((threadId) => deleteCodexLocalSession(
+        threadId,
+        session?.importedRolloutPath || null
+      ).then((result) => ({ threadId, result })))).then((results) => {
+        for (const item of results) {
+          plog('INFO', 'codex_local_session_deleted', {
+            sessionId: sessionId.slice(0, 8),
+            threadId: item.threadId,
+            removedFiles: item.result.removedFiles,
+            removedDbRows: item.result.removedDbRows,
+          });
+        }
       }).catch((error) => {
         plog('WARN', 'codex_local_session_delete_failed', {
           sessionId: sessionId.slice(0, 8),
-          threadId: session?.codexThreadId || null,
+          threadIds: codexThreadIds,
           error: error?.message || String(error),
         });
       });
     } else {
-      deleteClaudeLocalSession(session?.claudeSessionId || null);
+      for (const runtimeId of getAllRuntimeSessionIds(session, 'claude')) {
+        deleteClaudeLocalSession(runtimeId);
+      }
     }
     sendSessionList(ws);
   } catch {
@@ -3529,6 +4890,7 @@ function handleMessage(ws, msg, options = {}) {
       agent,
       claudeSessionId: null,
       codexThreadId: null,
+      runtimeContexts: { claude: {}, codex: {} },
       model: null,
       permissionMode: mode || 'yolo',
       totalCost: 0,
@@ -3589,6 +4951,7 @@ function handleMessage(ws, msg, options = {}) {
       hasUnread: false,
       historyPending: false,
       isRunning: false,
+      ...buildSessionRuntimeMeta(session),
     });
   }
   sendSessionList(ws);
@@ -3599,6 +4962,20 @@ function handleMessage(ws, msg, options = {}) {
   if (spawnSpec?.error) {
     return wsSend(ws, { type: 'error', message: spawnSpec.error });
   }
+  const shouldInjectCarryover = !!(spawnSpec?.threadReset && !hideInHistory && !normalizedText.startsWith('/'));
+  const carryoverHistory = shouldInjectCarryover
+    ? (Array.isArray(session.messages) ? session.messages.slice(0, -1) : [])
+    : [];
+  const threadCarryover = shouldInjectCarryover
+    ? buildThreadCarryoverPayload(session, textValue, resolvedAttachments, carryoverHistory, spawnSpec.threadReset)
+    : null;
+  if (spawnSpec?.warningMessage) {
+    wsSend(ws, { type: 'system_message', message: spawnSpec.warningMessage });
+  }
+  if (spawnSpec?.threadReset) {
+    wsSend(ws, { type: 'system_message', message: buildThreadCarryoverNotice(threadCarryover) });
+  }
+  const runtimeInputText = threadCarryover?.prompt || textValue;
 
   // === Detached process with file-based I/O ===
   const dir = runDir(currentSessionId);
@@ -3610,7 +4987,7 @@ function handleMessage(ws, msg, options = {}) {
 
   if (isClaudeSession(session) && resolvedAttachments.length > 0) {
     const content = [];
-    if (textValue) content.push({ type: 'text', text: textValue });
+    if (runtimeInputText) content.push({ type: 'text', text: runtimeInputText });
     for (const attachment of resolvedAttachments) {
       const data = fs.readFileSync(attachment.path).toString('base64');
       content.push({
@@ -3630,7 +5007,7 @@ function handleMessage(ws, msg, options = {}) {
       },
     })}\n`);
   } else {
-    fs.writeFileSync(inputPath, textValue);
+    fs.writeFileSync(inputPath, runtimeInputText);
   }
 
   const inputFd = fs.openSync(inputPath, 'r');
@@ -3638,6 +5015,7 @@ function handleMessage(ws, msg, options = {}) {
   const errorFd = fs.openSync(errorPath, 'w');
 
   let proc;
+  let entry = null;
   try {
     proc = spawn(spawnSpec.command, spawnSpec.args, {
       env: spawnSpec.env,
@@ -3670,11 +5048,24 @@ function handleMessage(ws, msg, options = {}) {
     mode: spawnSpec.mode,
     model: session.model || 'default',
     resume: spawnSpec.resume,
+    threadResetReason: spawnSpec.threadReset?.reason || null,
+    carryover: threadCarryover
+      ? {
+          summaryDetailed: threadCarryover.summaryDetailed,
+          recentCount: threadCarryover.recentCount,
+          historyCount: threadCarryover.historyCount,
+        }
+      : null,
     args: spawnSpec.args.join(' '),
   });
 
   // Fast exit detection (while Node.js is running)
   proc.on('exit', (code, signal) => {
+    if (entry) {
+      entry.pendingProcessComplete = true;
+      entry.pendingExitCode = code;
+      entry.pendingSignal = signal;
+    }
     plog('INFO', 'process_exit_event', {
       sessionId: currentSessionId.slice(0, 8),
       pid: proc.pid,
@@ -3685,13 +5076,29 @@ function handleMessage(ws, msg, options = {}) {
     setTimeout(() => handleProcessComplete(currentSessionId, code, signal), 300);
   });
 
-  const entry = {
+  entry = {
     pid: proc.pid,
     ws,
     agent: getSessionAgent(session),
     cwd: spawnSpec.cwd,
-    claudeRuntimeSessionId: isClaudeSession(session) ? (session.claudeSessionId || null) : null,
-    persistedClaudeSessionId: isClaudeSession(session) ? (session.claudeSessionId || null) : null,
+    claudeRuntimeFingerprint: isClaudeSession(session) ? (spawnSpec.runtimeFingerprint || null) : null,
+    codexRuntimeFingerprint: getSessionAgent(session) === 'codex' ? (spawnSpec.runtimeFingerprint || null) : null,
+    runtimeChannelKey: spawnSpec.channelKey || null,
+    runtimeChannelDescriptor: spawnSpec.channelDescriptor || null,
+    claudeRuntimeSessionId: isClaudeSession(session)
+      ? (getRuntimeSessionId(session, {
+          agent: 'claude',
+          channelKey: spawnSpec.channelKey || null,
+          channelDescriptor: spawnSpec.channelDescriptor || null,
+        }) || null)
+      : null,
+    persistedClaudeSessionId: isClaudeSession(session)
+      ? (getRuntimeSessionId(session, {
+          agent: 'claude',
+          channelKey: spawnSpec.channelKey || null,
+          channelDescriptor: spawnSpec.channelDescriptor || null,
+        }) || null)
+      : null,
     claudePendingCostDelta: 0,
     claudeSessionTotalCost: session.totalCost || 0,
     fullText: '',
@@ -3702,6 +5109,9 @@ function handleMessage(ws, msg, options = {}) {
     lastUsage: null,
     lastError: null,
     errorSent: false,
+    pendingProcessComplete: false,
+    pendingExitCode: null,
+    pendingSignal: null,
     tailer: null,
   };
   setActiveProcess(currentSessionId, entry);
@@ -3759,15 +5169,22 @@ const {
   MODEL_MAP,
   loadModelConfig,
   applyCustomTemplateToSettings,
+  getClaudeRuntimeFingerprint,
   loadCodexConfig,
   prepareCodexCustomRuntime,
+  getCodexRuntimeFingerprint,
   wsSend,
   truncateObj,
   sanitizeToolInput,
   loadSession,
   saveSession,
+  getRuntimeSessionState,
+  getFallbackRuntimeSessionState,
+  setRuntimeSessionState,
   setRuntimeSessionId,
   getRuntimeSessionId,
+  clearRuntimeSessionId,
+  runtimeFingerprintsCompatible,
 });
 
 // === Check Update ===
@@ -3786,7 +5203,7 @@ function handleCheckUpdate(ws) {
   const options = {
     hostname: 'raw.githubusercontent.com',
     path: '/HsMirage/webcoding/main/CHANGELOG.md',
-    headers: { 'User-Agent': 'cc-web-update-check' },
+    headers: { 'User-Agent': 'webcoding-update-check' },
     timeout: 10000,
   };
 
@@ -3944,8 +5361,10 @@ function getImportedSessionIds() {
       .map((entry) => entry.name);
     for (const f of files) {
       try {
-        const s = JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, f), 'utf8'));
-        if (s?.claudeSessionId) imported.add(String(s.claudeSessionId));
+        const s = normalizeSession(JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, f), 'utf8')));
+        for (const runtimeId of getAllRuntimeSessionIds(s, 'claude')) {
+          imported.add(String(runtimeId));
+        }
       } catch {}
     }
   } catch {}
@@ -4073,13 +5492,13 @@ function handleImportNativeSession(ws, msg) {
   const lines = content.split('\n');
   const messages = parseJsonlToMessages(lines);
 
-  // Find or create cc-web session with this claudeSessionId
+  // Find or create webcoding session with this claudeSessionId
   let existingSession = null;
   try {
     for (const f of fs.readdirSync(SESSIONS_DIR).filter(f => f.endsWith('.json'))) {
       try {
-        const s = JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, f), 'utf8'));
-        if (s.claudeSessionId === sessionId) { existingSession = s; break; }
+        const s = normalizeSession(JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, f), 'utf8')));
+        if (sessionHasRuntimeId(s, 'claude', sessionId)) { existingSession = s; break; }
       } catch {}
     }
   } catch {}
@@ -4112,6 +5531,7 @@ function handleImportNativeSession(ws, msg) {
     agent: 'claude',
     claudeSessionId: sessionId,
     codexThreadId: null,
+    runtimeContexts: existingSession?.runtimeContexts || { claude: {}, codex: {} },
     importedFrom: projectDir,
     model: existingSession?.model || null,
     permissionMode: existingSession?.permissionMode || 'yolo',
@@ -4137,6 +5557,7 @@ function handleImportNativeSession(ws, msg) {
     hasUnread: false,
     historyPending: false,
     isRunning: false,
+    ...buildSessionRuntimeMeta(session),
   });
   sendSessionList(ws);
 }
@@ -4195,7 +5616,7 @@ function handleImportCodexSession(ws, msg) {
     for (const f of fs.readdirSync(SESSIONS_DIR).filter(f => f.endsWith('.json'))) {
       try {
         const s = normalizeSession(JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, f), 'utf8')));
-        if (s.codexThreadId === threadId) { existingSession = s; break; }
+        if (sessionHasRuntimeId(s, 'codex', threadId)) { existingSession = s; break; }
       } catch {}
     }
   } catch {}
@@ -4209,6 +5630,7 @@ function handleImportCodexSession(ws, msg) {
     agent: 'codex',
     claudeSessionId: null,
     codexThreadId: threadId,
+    runtimeContexts: existingSession?.runtimeContexts || { claude: {}, codex: {} },
     importedFrom: 'codex',
     importedRolloutPath: parsed.filePath,
     model: existingSession?.model || null,
@@ -4236,6 +5658,7 @@ function handleImportCodexSession(ws, msg) {
     hasUnread: false,
     historyPending: false,
     isRunning: false,
+    ...buildSessionRuntimeMeta(session),
   });
   sendSessionList(ws);
 }
@@ -4250,8 +5673,11 @@ function handleListCwdSuggestions(ws) {
     for (const file of files) {
       const session = loadSession(file.replace(/\.json$/, ''));
       if (!session) continue;
-      const localMeta = getSessionAgent(session) === 'claude' && session.claudeSessionId && !session.cwd
-        ? resolveClaudeSessionLocalMeta(session.claudeSessionId)
+      const preferredClaudeRuntimeId = getSessionAgent(session) === 'claude'
+        ? getPreferredRuntimeSessionId(session, 'claude')
+        : null;
+      const localMeta = getSessionAgent(session) === 'claude' && preferredClaudeRuntimeId && !session.cwd
+        ? resolveClaudeSessionLocalMeta(preferredClaudeRuntimeId)
         : null;
       const cwd = session.cwd || localMeta?.cwd || activeProcesses.get(session.id)?.cwd || null;
       if (cwd) paths.add(cwd);
@@ -4415,5 +5841,5 @@ setInterval(() => {
 plog('INFO', 'server_start', { port: PORT });
 
 server.listen(PORT, HOST, () => {
-  console.log(`CC-Web server listening on ${HOST}:${PORT}`);
+  console.log(`webcoding server listening on ${HOST}:${PORT}`);
 });
