@@ -1645,6 +1645,7 @@
   function handleToolStartMessage(msg) {
     if (!composeState.isGenerating) startGenerating();
     if (composeState.pendingText) flushRender();
+    markStreamingProcessTextSegments();
     composeState.activeToolCalls.set(msg.toolUseId, { name: msg.name, input: msg.input, kind: msg.kind || null, meta: msg.meta || null, done: false });
     appendToolCall(msg.toolUseId, msg.name, msg.input, false, msg.kind || null, msg.meta || null);
   }
@@ -1931,9 +1932,11 @@
     return placeholder;
   }
 
-  function createTextSegmentElement(text = '') {
+  function createTextSegmentElement(text = '', options = {}) {
+    const phase = options.phase === 'process' ? 'process' : 'final';
     const textDiv = document.createElement('div');
-    textDiv.className = 'msg-text msg-segment msg-segment-text';
+    textDiv.className = `msg-text msg-segment msg-segment-text msg-segment-${phase}`;
+    textDiv.dataset.phase = phase;
     textDiv.dataset.rawText = text;
     textDiv.innerHTML = text ? renderMarkdown(text) : '';
     return textDiv;
@@ -1959,7 +1962,7 @@
     clearStreamingPlaceholder(bubble);
     const last = bubble.lastElementChild;
     if (last && last.classList.contains('msg-segment-text')) return last;
-    const textDiv = createTextSegmentElement('');
+    const textDiv = createTextSegmentElement('', { phase: 'final' });
     bubble.appendChild(textDiv);
     return textDiv;
   }
@@ -2094,25 +2097,52 @@
     return section;
   }
 
+  function annotateMessageSegmentPhases(segments) {
+    const list = Array.isArray(segments) ? segments.map((segment) => ({ ...segment })) : [];
+    let finalTextIndex = -1;
+    for (let index = list.length - 1; index >= 0; index -= 1) {
+      const segment = list[index];
+      if (segment?.type === 'text' && String(segment.text || '').trim()) {
+        finalTextIndex = index;
+        break;
+      }
+    }
+    const conclusionTextIndex = finalTextIndex !== -1
+      && !list.slice(finalTextIndex + 1).some((segment) => segment && segment.type !== 'text')
+      ? finalTextIndex
+      : -1;
+    return list.map((segment, index) => {
+      if (!segment || segment.type !== 'text') return segment;
+      return {
+        ...segment,
+        phase: conclusionTextIndex !== -1 && index === conclusionTextIndex ? 'final' : 'process',
+      };
+    });
+  }
+
+  function normalizeSegmentsForDisplay(segments) {
+    const normalized = (Array.isArray(segments) ? segments : [])
+      .filter(Boolean)
+      .map((segment) => {
+        if (segment.type === 'tool_call') {
+          return {
+            ...segment,
+            type: 'tool_call',
+            done: segment.done !== false,
+          };
+        }
+        return {
+          type: 'text',
+          text: typeof segment.text === 'string' ? segment.text : '',
+        };
+      })
+      .filter((segment) => segment.type === 'tool_call' || segment.text);
+    return annotateMessageSegmentPhases(collapseToolSegmentsForDisplay(normalized));
+  }
+
   function normalizeMessageSegments(message) {
     if (Array.isArray(message?.segments) && message.segments.length > 0) {
-      const normalized = message.segments
-        .filter(Boolean)
-        .map((segment) => {
-          if (segment.type === 'tool_call') {
-            return {
-              ...segment,
-              type: 'tool_call',
-              done: segment.done !== false,
-            };
-          }
-          return {
-            type: 'text',
-            text: typeof segment.text === 'string' ? segment.text : '',
-          };
-        })
-        .filter((segment) => segment.type === 'tool_call' || segment.text);
-      return collapseToolSegmentsForDisplay(normalized);
+      return normalizeSegmentsForDisplay(message.segments);
     }
 
     const fallback = [];
@@ -2125,7 +2155,7 @@
         fallback.push({ type: 'tool_call', ...tool, done: tool.done !== false });
       });
     }
-    return collapseToolSegmentsForDisplay(fallback);
+    return normalizeSegmentsForDisplay(fallback);
   }
 
   function collapseToolSegmentsForDisplay(segments) {
@@ -2135,7 +2165,7 @@
 
     function flushToolRun() {
       if (toolRun.length === 0) return;
-      if (toolRun.length > TOOL_GROUP_THRESHOLD) {
+      if (toolRun.length >= TOOL_GROUP_THRESHOLD) {
         collapsed.push({
           type: 'tool_group',
           items: toolRun.map((tool) => ({ ...tool, done: tool.done !== false })),
@@ -2220,7 +2250,7 @@
     }
     const text = typeof segment.text === 'string' ? segment.text : '';
     if (!text) return null;
-    return createTextSegmentElement(text);
+    return createTextSegmentElement(text, { phase: segment.phase || 'final' });
   }
 
   function renderAssistantSegments(bubble, message) {
@@ -2237,9 +2267,19 @@
     const bubble = getStreamingBubble();
     if (!bubble) return;
     bubble.innerHTML = '';
-    segments.forEach((segment) => {
+    normalizeSegmentsForDisplay(segments).forEach((segment) => {
       const segmentEl = buildMessageSegmentElement(segment);
       if (segmentEl) bubble.appendChild(segmentEl);
+    });
+  }
+
+  function markStreamingProcessTextSegments() {
+    const bubble = getStreamingBubble();
+    if (!bubble) return;
+    bubble.querySelectorAll('.msg-segment-text').forEach((segment) => {
+      segment.classList.remove('msg-segment-final');
+      segment.classList.add('msg-segment-process');
+      segment.dataset.phase = 'process';
     });
   }
 
@@ -2255,9 +2295,11 @@
     const epoch = renderEpoch;
     _previewCodeMap.clear();
     _previewCodeId = 0;
+    messagesDiv.classList.add('messages-switching');
     messagesDiv.innerHTML = '';
     if (messages.length === 0) {
       messagesDiv.innerHTML = buildWelcomeMarkup(sessionState.currentAgent);
+      requestAnimationFrame(() => messagesDiv.classList.remove('messages-switching'));
       return;
     }
     if (options.immediate) {
@@ -2265,6 +2307,7 @@
       messages.forEach((message) => frag.appendChild(buildMsgElement(message)));
       messagesDiv.appendChild(frag);
       scrollToBottom();
+      requestAnimationFrame(() => messagesDiv.classList.remove('messages-switching'));
       return;
     }
     
@@ -2293,6 +2336,7 @@
     for (let i = batches[0][0]; i < batches[0][1]; i++) frag0.appendChild(buildMsgElement(messages[i]));
     messagesDiv.appendChild(frag0);
     scrollToBottom();
+    requestAnimationFrame(() => messagesDiv.classList.remove('messages-switching'));
 
     // Render remaining batches asynchronously with requestAnimationFrame
     // This prevents blocking the main thread and maintains responsiveness
@@ -2599,7 +2643,7 @@
       const inner = trailingGroup.querySelector('.tool-group-inner');
       inner.appendChild(details);
       refreshToolGroupSummary(trailingGroup);
-    } else if (trailingCluster.length + 1 > TOOL_GROUP_THRESHOLD) {
+    } else if (trailingCluster.length + 1 >= TOOL_GROUP_THRESHOLD) {
       const group = createToolGroupElement([]);
       if (trailingCluster[0]) bubble.insertBefore(group, trailingCluster[0]);
       else bubble.appendChild(group);
@@ -3020,7 +3064,7 @@
     const isSpecialGroup = project.id === '__ungrouped__';
     const isVirtualCwd = Boolean(project.isVirtualCwd);
     const containsCurrentSession = groupSessions.some((session) => session.id === sessionState.currentSessionId);
-    const isCollapsed = containsCurrentSession ? false : collapsedProjects.has(project.id);
+    const isCollapsed = collapsedProjects.has(project.id);
 
     const group = document.createElement('section');
     group.className = 'project-group'
@@ -3797,7 +3841,9 @@
   // --- Send Message ---
   function sendMessage() {
     const text = msgInput.value.trim();
-    if ((!text && composeState.pendingAttachments.length === 0) || composeState.isGenerating || isBlockingSessionLoad()) return;
+    const isPlanModeActive = sessionState.currentMode === 'plan' && sessionState.currentAgent === 'claude';
+    if ((!text && composeState.pendingAttachments.length === 0) || isBlockingSessionLoad()) return;
+    if (composeState.isGenerating && !isPlanModeActive) return;
     hideCmdMenu();
     hideOptionPicker();
 
@@ -3839,7 +3885,7 @@
     composeState.pendingAttachments = [];
     renderPendingAttachments();
     autoResize();
-    startGenerating();
+    if (!composeState.isGenerating) startGenerating();
   }
 
   function autoResize() {

@@ -84,6 +84,18 @@ function sleep(ms) {
     process.exit(1);
   }
 
+  if (input === 'trigger codex silent exit') {
+    process.stdout.write(`${JSON.stringify({
+      type: 'item.completed',
+      item: {
+        id: 'item_msg_partial',
+        type: 'agent_message',
+        text: 'Codex mock partial before silent exit.',
+      },
+    })}\n`);
+    process.exit(1);
+  }
+
   if (input === 'trigger codex metadata warning') {
     process.stdout.write(`${JSON.stringify({
       type: 'item.completed',

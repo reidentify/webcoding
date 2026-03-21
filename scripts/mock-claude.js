@@ -44,6 +44,10 @@ function readStdin() {
     message: { content: [{ type: 'text', text }] },
   })}\n`);
 
+  if (input === 'trigger claude silent exit') {
+    process.exit(1);
+  }
+
   process.stdout.write(`${JSON.stringify({
     type: 'result',
     session_id: sessionId,

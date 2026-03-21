@@ -26,7 +26,7 @@
   --input-max-height: 200px;
   --safe-bottom: env(safe-area-inset-bottom, 0px);
   --font-ui: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Hiragino Sans', 'Noto Sans CJK SC', sans-serif;
-  --font-mono: 'Space Mono', 'Courier New', monospace;
+  --font-mono: 'Space Mono', 'Courier New', 'Noto Sans Mono CJK SC', 'PingFang SC', 'Microsoft YaHei', monospace;
 
   /* --- Semantic tokens --- */
   --line: #383838;
@@ -871,8 +871,8 @@ body.session-loading-active {
   min-height: 0;
 }
 .chat-header {
-  height: var(--header-height);
-  min-height: var(--header-height);
+  height: 40px;
+  min-height: 40px;
   display: flex;
   align-items: center;
   padding: 0 16px;
@@ -1113,15 +1113,20 @@ body.session-loading-active {
   height: 100%;
   overflow-y: scroll;
   overflow-x: hidden;
-  padding: 16px;
-  padding-right: 20px;
+  padding: 16px 20px;
+  padding-right: 24px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 10px;
   -webkit-overflow-scrolling: touch;
   overscroll-behavior: contain;
   -ms-overflow-style: none;
   scrollbar-width: none;
+  transition: opacity 80ms ease;
+}
+.messages.messages-switching {
+  opacity: 0;
+  pointer-events: none;
 }
 .messages::-webkit-scrollbar { display: none; }
 /* Custom scrollbar */
@@ -1285,7 +1290,7 @@ body.session-loading-active {
 .msg {
   display: flex;
   gap: 10px;
-  max-width: 85%;
+  max-width: 90%;
   min-width: 0;
   animation: fadeIn 0.25s ease;
 }
@@ -1364,6 +1369,22 @@ body.session-loading-active {
 }
 .msg-segment-text {
   min-width: 0;
+  font-size: 15px;
+  line-height: 1.75;
+  color: var(--text-primary);
+  opacity: 1;
+}
+.msg-segment-text.msg-segment-process {
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--text-secondary);
+  opacity: 0.88;
+}
+.msg-segment-text.msg-segment-final {
+  font-size: 15px;
+  line-height: 1.75;
+  color: var(--text-primary);
+  opacity: 1;
 }
 .msg-segment-pending {
   min-height: 24px;
@@ -1544,16 +1565,29 @@ body.session-loading-active {
 
 /* Tool calls */
 .tool-call {
-  margin: 8px 0;
-  border: 2px solid var(--line);
+  margin: 4px 0;
+  border: 1px solid var(--line);
   border-radius: 0;
   overflow: hidden;
+  font-size: 11px;
+  opacity: 0.6;
 }
 .tool-call.codex-command {
   border-color: var(--line);
 }
 .tool-call.codex-reasoning {
-  border-color: var(--line);
+  border-color: var(--text-muted);
+  border-style: dashed;
+  opacity: 0.88;
+}
+.tool-call.codex-reasoning summary {
+  opacity: 0.72;
+}
+.tool-call.codex-reasoning .tool-call-label {
+  font-weight: 400;
+  color: var(--text-muted);
+  text-transform: none;
+  letter-spacing: 0;
 }
 .tool-call.codex-file-change {
   border-color: var(--line);
@@ -1561,7 +1595,7 @@ body.session-loading-active {
 .tool-call summary {
   padding: 8px 12px;
   cursor: pointer;
-  font-size: 13px;
+  font-size: 11px;
   color: var(--text-secondary);
   background: var(--bg-secondary);
   display: flex;
@@ -1653,7 +1687,7 @@ body.session-loading-active {
 }
 .tool-call-content {
   padding: 8px 12px;
-  font-size: 12px;
+  font-size: 11px;
   color: var(--text-secondary);
   background: var(--bg-primary);
   border-top: 2px solid var(--line);
@@ -1668,8 +1702,11 @@ body.session-loading-active {
 .tool-call-content.reasoning {
   font-family: var(--font-ui);
   line-height: 1.7;
-  color: var(--text-primary);
-  background: var(--surface);
+  color: var(--text-muted);
+  background: var(--bg-primary);
+  font-style: italic;
+  font-size: 11px;
+  opacity: 0.9;
 }
 .tool-call-content.command,
 .tool-call-content.file-change {
@@ -1922,8 +1959,8 @@ body.session-loading-active {
 
 /* === Input Area === */
 .input-area {
-  padding: 10px 16px;
-  padding-bottom: max(14px, var(--safe-bottom));
+  padding: 8px 16px;
+  padding-bottom: max(12px, var(--safe-bottom));
   background: var(--bg-secondary);
   border-top: 2px solid var(--line);
   flex-shrink: 0;
@@ -1932,7 +1969,7 @@ body.session-loading-active {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
-  max-width: 800px;
+  max-width: min(920px, 100%);
   margin: 0 auto 10px;
 }
 .attachment-chip {
@@ -1999,7 +2036,7 @@ body.session-loading-active {
   border: 2px solid var(--line);
   border-radius: 2px;
   padding: 8px 12px;
-  max-width: 800px;
+  max-width: min(920px, 100%);
   margin: 0 auto;
   box-shadow: 4px 4px 0 var(--line);
   transition: box-shadow 120ms ease;
@@ -2359,6 +2396,8 @@ body.session-loading-active {
 @media (max-width: 480px) {
   .msg-avatar { width: 28px; height: 28px; font-size: 11px; }
   .msg-bubble { padding: 10px 12px; font-size: 14px; }
+  .msg-segment-text.msg-segment-process { font-size: 12px; }
+  .msg-segment-text.msg-segment-final { font-size: 14px; }
   .code-block-wrapper pre code { font-size: 12px; }
   .input-wrapper { padding: 6px 10px; box-shadow: 3px 3px 0 var(--line); }
   .attach-btn { width: 38px; height: 38px; }

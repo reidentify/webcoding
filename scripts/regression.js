@@ -394,7 +394,7 @@ async function stopBridgeProcess(handle) {
   await stopServer(handle.child);
 }
 
-async function startResponsesFallbackUpstream(port) {
+async function startResponsesFallbackUpstream(port, options = {}) {
   const counters = {
     responses: 0,
     chatCompletions: 0,
@@ -442,14 +442,16 @@ async function startResponsesFallbackUpstream(port) {
       }
       if (req.method === 'POST' && requestUrl.pathname === '/v1/responses') {
         counters.responses += 1;
-        res.writeHead(500, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({
+        const responsesStatus = Number(options.responsesStatus || 500);
+        const responsesError = options.responsesError || {
           error: {
             message: 'not implemented',
             type: 'new_api_error',
             code: 'convert_request_failed',
           },
-        }));
+        };
+        res.writeHead(responsesStatus, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(responsesError));
         return;
       }
       if (req.method === 'POST' && requestUrl.pathname === '/v1/chat/completions') {
@@ -477,6 +479,72 @@ async function startResponsesFallbackUpstream(port) {
         }));
         return;
       }
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'not found' } }));
+    });
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(port, '127.0.0.1', resolve);
+  });
+  return {
+    server,
+    counters,
+    requests,
+    async close() {
+      await new Promise((resolve) => server.close(() => resolve()));
+    },
+  };
+}
+
+async function startStreamingResponsesUpstream(port) {
+  const counters = {
+    responses: 0,
+  };
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    const requestUrl = new URL(req.url, `http://127.0.0.1:${port}`);
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      const bodyJson = (() => {
+        try { return body ? JSON.parse(body) : null; } catch { return null; }
+      })();
+      requests.push({
+        method: req.method,
+        path: requestUrl.pathname,
+        bodyText: body,
+        bodyJson,
+      });
+
+      if (req.method === 'POST' && requestUrl.pathname === '/v1/responses') {
+        counters.responses += 1;
+        if (bodyJson?.stream !== true) {
+          res.writeHead(504, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({
+            error: {
+              message: 'expected streaming upstream request',
+              type: 'gateway_timeout',
+              code: 504,
+            },
+          }));
+          return;
+        }
+        res.writeHead(200, {
+          'content-type': 'text/event-stream',
+          'cache-control': 'no-cache',
+          connection: 'keep-alive',
+        });
+        res.write('event: response.created\n');
+        res.write(`data: ${JSON.stringify({ type: 'response.created', response: { id: 'resp_stream', model: bodyJson.model || 'fallback-model', output: [] } })}\n\n`);
+        res.write('event: response.output_text.delta\n');
+        res.write(`data: ${JSON.stringify({ type: 'response.output_text.delta', output_index: 0, content_index: 0, delta: 'stream pong' })}\n\n`);
+        res.write('event: response.completed\n');
+        res.write(`data: ${JSON.stringify({ type: 'response.completed', response: { id: 'resp_stream', model: bodyJson.model || 'fallback-model', output: [], usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } } })}\n\n`);
+        res.end();
+        return;
+      }
+
       res.writeHead(404, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: { message: 'not found' } }));
     });
@@ -1236,6 +1304,30 @@ async function runRuntimeErrorRegressionCase({ port, password, logsDir }) {
     );
     const processCompleteLine = findProcessLogLine(logsDir, erroredSession.sessionId, 'process_complete');
     assert(processCompleteLine && processCompleteLine.includes('"exitCode":1'), 'Non-zero CLI exit should be recorded in process_complete log');
+
+    const silentCodexSession = await client.sendAndWaitType(
+      buildAgentMessagePayload({ text: 'trigger codex silent exit', mode: 'yolo', agent: 'codex' }),
+      'session_info',
+      (msg) => msg.agent === 'codex' && msg.title === 'trigger codex silent exit',
+    );
+    await client.waitForType('text_delta', (msg) => /silent exit/.test(msg.text || ''), 8000);
+    const silentCodexError = await client.waitForType('error', (msg) => /Codex 任务异常结束（退出码 1）/.test(msg.message || ''), 8000);
+    assert(/Codex 任务异常结束（退出码 1）/.test(silentCodexError.message || ''), 'Codex silent non-zero exit should surface a generic failure message');
+    await client.waitForType('done', (msg) => msg.sessionId === silentCodexSession.sessionId, 8000);
+    const silentCodexProcessCompleteLine = findProcessLogLine(logsDir, silentCodexSession.sessionId, 'process_complete');
+    assert(silentCodexProcessCompleteLine.includes('process exited with non-zero status 1 but returned no stderr'), 'Codex silent exit should be explicit in process_complete log');
+
+    const silentClaudeSession = await client.sendAndWaitType(
+      buildAgentMessagePayload({ text: 'trigger claude silent exit', mode: 'yolo', agent: 'claude' }),
+      'session_info',
+      (msg) => msg.agent === 'claude' && msg.title === 'trigger claude silent exit',
+    );
+    await client.waitForType('text_delta', (msg) => /trigger claude silent exit/.test(msg.text || ''), 8000);
+    const silentClaudeError = await client.waitForType('error', (msg) => /Claude 任务异常结束（退出码 1）/.test(msg.message || ''), 8000);
+    assert(/Claude 任务异常结束（退出码 1）/.test(silentClaudeError.message || ''), 'Claude silent non-zero exit should surface a generic failure message');
+    await client.waitForType('done', (msg) => msg.sessionId === silentClaudeSession.sessionId, 8000);
+    const silentClaudeProcessCompleteLine = findProcessLogLine(logsDir, silentClaudeSession.sessionId, 'process_complete');
+    assert(silentClaudeProcessCompleteLine.includes('process exited with non-zero status 1 but returned no stderr'), 'Claude silent exit should be explicit in process_complete log');
   });
 }
 
@@ -1683,6 +1775,95 @@ async function runBridgeResponsesFallbackRegressionCase({ tempRoot }) {
 
     assert(upstream.counters.responses === 2, `Bridge should probe /responses twice, got ${upstream.counters.responses}`);
     assert(upstream.counters.chatCompletions === 2, `Bridge should fall back to /chat/completions twice, got ${upstream.counters.chatCompletions}`);
+  } finally {
+    await stopBridgeProcess(bridgeHandle);
+    await upstream.close();
+  }
+}
+
+async function runBridgeResponses404FallbackRegressionCase({ tempRoot }) {
+  const bridgeTempDir = path.join(tempRoot, 'bridge-fallback-404');
+  mkdirp(bridgeTempDir);
+  const upstreamPort = await getFreePort();
+  const upstream = await startResponsesFallbackUpstream(upstreamPort, {
+    responsesStatus: 404,
+    responsesError: {
+      error: {
+        message: 'openai_error',
+        type: 'bad_response_status_code',
+        param: '',
+        code: 'bad_response_status_code',
+      },
+    },
+  });
+  let bridgeHandle = null;
+  try {
+    bridgeHandle = await startBridgeProcess(bridgeTempDir, upstreamPort);
+
+    const openAiResponse = await requestHttpJson({
+      port: bridgeHandle.state.port,
+      path: '/openai/responses',
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer bridge-regression-token',
+        'content-type': 'application/json',
+        accept: 'text/event-stream',
+      },
+      body: JSON.stringify({
+        model: 'fallback-model',
+        input: [{
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: 'ping' }],
+        }],
+        stream: true,
+      }),
+    });
+    assert(openAiResponse.statusCode === 200, `Bridge 404 fallback should return 200, got ${openAiResponse.statusCode}`);
+    assert(/event: response\.created/.test(openAiResponse.text), 'Bridge 404 fallback should emit OpenAI SSE');
+    assert(/pong/.test(openAiResponse.text), 'Bridge 404 fallback should include translated fallback text');
+    assert(upstream.counters.responses === 1, `Bridge 404 fallback should probe /responses once, got ${upstream.counters.responses}`);
+    assert(upstream.counters.chatCompletions === 1, `Bridge 404 fallback should fall back to /chat/completions once, got ${upstream.counters.chatCompletions}`);
+  } finally {
+    await stopBridgeProcess(bridgeHandle);
+    await upstream.close();
+  }
+}
+
+async function runBridgeStreamingPassthroughRegressionCase({ tempRoot }) {
+  const bridgeTempDir = path.join(tempRoot, 'bridge-streaming');
+  mkdirp(bridgeTempDir);
+  const upstreamPort = await getFreePort();
+  const upstream = await startStreamingResponsesUpstream(upstreamPort);
+  let bridgeHandle = null;
+  try {
+    bridgeHandle = await startBridgeProcess(bridgeTempDir, upstreamPort);
+
+    const streamedResponse = await requestHttpJson({
+      port: bridgeHandle.state.port,
+      path: '/openai/responses',
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer bridge-regression-token',
+        'content-type': 'application/json',
+        accept: 'text/event-stream',
+      },
+      body: JSON.stringify({
+        model: 'fallback-model',
+        input: [{
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: 'ping' }],
+        }],
+        stream: true,
+      }),
+    });
+    assert(streamedResponse.statusCode === 200, `Bridge streaming passthrough should return 200, got ${streamedResponse.statusCode}`);
+    assert(/event: response\.created/.test(streamedResponse.text), 'Bridge streaming passthrough should forward response.created');
+    assert(/stream pong/.test(streamedResponse.text), 'Bridge streaming passthrough should forward upstream delta text');
+
+    const responseRequest = upstream.requests.find((req) => req.path === '/v1/responses');
+    assert(responseRequest?.bodyJson?.stream === true, 'Bridge should preserve stream=true when proxying OpenAI responses');
   } finally {
     await stopBridgeProcess(bridgeHandle);
     await upstream.close();
@@ -2973,6 +3154,63 @@ async function runCodexReasoningEffortRegressionCase({ port, password, tempRoot,
   });
 }
 
+async function runCodexBridgeProtocolNormalizationRegressionCase({ port, password, configDir, logsDir }) {
+  await withAuthedClient(port, password, async ({ client }) => {
+    const modelConfigMsg = await saveConfigAndWait(
+      client,
+      'save_model_config',
+      {
+        mode: 'custom',
+        activeTemplate: 'Codex Bridge Mislabel',
+        templates: [{
+          name: 'Codex Bridge Mislabel',
+          apiKey: 'sk-codex-bridge-mislabel',
+          apiBase: 'https://bridge-mislabel.example.test',
+          upstreamType: 'anthropic',
+          defaultModel: 'gpt-5.4-large',
+          opusModel: 'gpt-5.4-large',
+          sonnetModel: 'gpt-5.4-large',
+          haikuModel: 'gpt-5.4-mini',
+        }],
+      },
+      'model_config',
+    );
+    const correctedTemplate = (modelConfigMsg.config.templates || []).find((item) => item.name === 'Codex Bridge Mislabel');
+    assert(correctedTemplate && correctedTemplate.upstreamType === 'openai', 'OpenAI-compatible provider should be normalized back to openai protocol');
+
+    await saveConfigAndWait(
+      client,
+      'save_codex_config',
+      {
+        mode: 'unified',
+        sharedTemplate: 'Codex Bridge Mislabel',
+        enableSearch: false,
+      },
+      'codex_config',
+    );
+
+    const session = await client.sendAndWaitType(
+      buildAgentMessagePayload({ text: 'verify codex bridge normalization', mode: 'yolo', agent: 'codex' }),
+      'session_info',
+      (msg) => msg.agent === 'codex' && msg.title === 'verify codex bridge normalization',
+    );
+    await client.waitForType('done', (msg) => msg.sessionId === session.sessionId, 8000);
+
+    const spawnLine = findProcessLogLine(logsDir, session.sessionId, 'process_spawn');
+    const spawnArgs = spawnLine ? (JSON.parse(spawnLine).args || '') : '';
+    assert(/-c model_providers\.openai_compat\.base_url="http:\/\/127\.0\.0\.1:\d+\/openai"/.test(spawnArgs), 'Codex mislabel normalization should still route through the bridge openai endpoint');
+
+    const runtimeToml = fs.readFileSync(path.join(configDir, 'codex-runtime-home', 'config.toml'), 'utf8');
+    assert(/base_url = "http:\/\/127\.0\.0\.1:\d+\/openai"/.test(runtimeToml), 'Codex mislabel normalization should write the bridge openai base_url');
+
+    const bridgeRuntime = JSON.parse(fs.readFileSync(path.join(configDir, 'bridge-runtime.json'), 'utf8'));
+    const bridgeEntry = bridgeRuntime?.runtimes
+      ? Object.values(bridgeRuntime.runtimes).find((entry) => entry?.upstream?.name === 'Codex Bridge Mislabel')
+      : null;
+    assert(bridgeEntry && bridgeEntry.upstream?.kind === 'openai', 'Bridge runtime store should persist the corrected openai protocol');
+  });
+}
+
 async function runCodexMetadataWarningRegressionCase({ port, password }) {
   await withAuthedClient(port, password, async ({ client, messages }) => {
     const warningCwd = path.join(os.tmpdir(), 'webcoding-codex-warning');
@@ -3263,6 +3501,8 @@ async function main() {
       await runner.run('fetch_models apiBase version compatibility', () => runFetchModelsApiBaseCompatibilityRegressionCase(ctx));
       await runner.run('bridge ignores legacy reasoning effort config', () => runBridgeReasoningEffortRegressionCase(ctx));
       await runner.run('bridge responses fallback', () => runBridgeResponsesFallbackRegressionCase(ctx));
+      await runner.run('bridge responses 404 fallback', () => runBridgeResponses404FallbackRegressionCase(ctx));
+      await runner.run('bridge streaming passthrough', () => runBridgeStreamingPassthroughRegressionCase(ctx));
       await runner.run('bridge upstream apiBase version compatibility', () => runBridgeUpstreamApiBaseCompatibilityRegressionCase(ctx));
       await runner.run('bridge stale process refresh', () => runBridgeScriptRefreshRegressionCase(ctx));
       await runner.run('claude local model map from settings', () => runClaudeLocalModelMapRegressionCase(ctx));
@@ -3274,6 +3514,7 @@ async function main() {
       await runner.run('codex sticky resume inside managed runtime home', () => runCodexStickyUnifiedResumeRegressionCase(ctx));
       await runner.run('codex config migration', () => runCodexConfigMigrationRegressionCase(ctx));
       await runner.run('codex ignores legacy reasoning effort config', () => runCodexReasoningEffortRegressionCase(ctx));
+      await runner.run('codex bridge protocol normalization', () => runCodexBridgeProtocolNormalizationRegressionCase(ctx));
       await runner.run('codex metadata warning rendering', () => runCodexMetadataWarningRegressionCase(ctx));
       await runner.run('auth failures and repeated auth', () => runAuthRegressionCase(ctx));
       await runner.run('runtime error mapping', () => runRuntimeErrorRegressionCase(ctx));

@@ -704,11 +704,25 @@ const DEFAULT_CODEX_CONFIG = {
 };
 
 function normalizeModelTemplate(template) {
+  const apiBase = String(template?.apiBase || '').trim();
+  const name = String(template?.name || '').trim();
+  const modelHints = [
+    String(template?.defaultModel || '').trim(),
+    String(template?.opusModel || '').trim(),
+    String(template?.sonnetModel || '').trim(),
+    String(template?.haikuModel || '').trim(),
+  ].filter(Boolean);
+  const combinedHints = `${name}\n${apiBase}\n${modelHints.join('\n')}`.toLowerCase();
+  const looksLikeAnthropicProtocol = /(^|\b)claude-|anthropic|messages\b/.test(combinedHints);
+  const looksLikeOpenAiProtocol = /(^|\b)(gpt-|o1|o3|o4|openai|responses\b|chat\/completions|\/v1\b)/.test(combinedHints);
+  const upstreamType = template?.upstreamType === 'anthropic'
+    ? (looksLikeOpenAiProtocol && !looksLikeAnthropicProtocol ? 'openai' : 'anthropic')
+    : 'openai';
   return {
-    name: String(template?.name || '').trim(),
+    name,
     apiKey: String(template?.apiKey || ''),
-    apiBase: String(template?.apiBase || '').trim(),
-    upstreamType: template?.upstreamType === 'anthropic' ? 'anthropic' : 'openai',
+    apiBase,
+    upstreamType,
     defaultModel: String(template?.defaultModel || '').trim(),
     opusModel: String(template?.opusModel || '').trim(),
     sonnetModel: String(template?.sonnetModel || '').trim(),
@@ -3367,15 +3381,24 @@ function resolveProcessCompletionState(sessionId, entry, exitCode, signal) {
     : null;
   const pendingRetry = pendingCompactRetries.get(sessionId) || null;
   const stderrSnippet = readProcessStderrSnippet(sessionId);
+  const hasNonZeroExit = typeof exitCode === 'number' && exitCode !== 0;
+  const hasUnexpectedSignal = !!signal && signal !== 'SIGTERM';
   const rawCompletionError = entry.lastError || (
-    ((typeof exitCode === 'number' && exitCode !== 0) || (!!signal && signal !== 'SIGTERM'))
+    (hasNonZeroExit || hasUnexpectedSignal)
       ? (stderrSnippet || null)
+      : null
+  );
+  const loggedCompletionError = rawCompletionError || (
+    hasNonZeroExit
+      ? `process exited with non-zero status ${exitCode} but returned no stderr`
       : null
   );
   const contextLimitExceeded = isContextLimitError(entry.agent || 'claude', `${entry.fullText || ''}\n${stderrSnippet || ''}\n${rawCompletionError || ''}`);
   const completionError = rawCompletionError
     ? formatRuntimeError(entry.agent || 'claude', rawCompletionError, { exitCode, signal })
-    : null;
+    : hasNonZeroExit
+      ? formatRuntimeError(entry.agent || 'claude', '', { exitCode, signal })
+      : null;
   if (!entry.lastError && rawCompletionError) entry.lastError = rawCompletionError;
 
   plog(exitCode === 0 || exitCode === null ? 'INFO' : 'WARN', 'process_complete', {
@@ -3391,7 +3414,7 @@ function resolveProcessCompletionState(sessionId, entry, exitCode, signal) {
     toolCallCount: (entry.toolCalls || []).length,
     cost: entry.lastCost,
     usage: entry.lastUsage || null,
-    error: rawCompletionError,
+    error: loggedCompletionError,
     stderr: stderrSnippet || null,
     requestTooLarge: contextLimitExceeded,
   });
@@ -4879,6 +4902,30 @@ function handleMessage(ws, msg, options = {}) {
   }));
 
   if (sessionId && activeProcesses.has(sessionId)) {
+    const runningSession = loadSession(sessionId);
+    if (
+      runningSession &&
+      isClaudeSession(runningSession) &&
+      runningSession.permissionMode === 'plan' &&
+      normalizedText &&
+      resolvedAttachments.length === 0
+    ) {
+      // Plan mode: forward user input to the waiting process via stdin (input.txt append)
+      const inputPath = path.join(runDir(sessionId), 'input.txt');
+      try {
+        fs.appendFileSync(inputPath, normalizedText + '\n');
+        if (!hideInHistory) {
+          runningSession.messages.push({ role: 'user', content: textValue, attachments: [], timestamp: new Date().toISOString() });
+          runningSession.updated = new Date().toISOString();
+          saveSession(runningSession);
+          const entry = activeProcesses.get(sessionId);
+          if (entry) entry.ws = ws;
+        }
+      } catch (err) {
+        wsSend(ws, { type: 'error', message: '无法写入确认输入：' + err.message });
+      }
+      return;
+    }
     return wsSend(ws, { type: 'error', message: '正在处理中，请先点击停止按钮。' });
   }
 
