@@ -3751,6 +3751,47 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  if (req.method === 'GET' && url.pathname === '/api/localfile') {
+    const token = extractBearerToken(req);
+    if (!token || !hasActiveToken(token)) {
+      writeHeadWithSecurity(res, 401, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end('Not authenticated');
+    }
+    let rawPath = url.searchParams.get('path') || '';
+    try { rawPath = decodeURIComponent(rawPath); } catch {}
+    rawPath = rawPath.trim();
+    if (!rawPath || !path.isAbsolute(rawPath)) {
+      writeHeadWithSecurity(res, 400, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end('Invalid path');
+    }
+    const absPath = path.resolve(rawPath);
+    fs.readFile(absPath, 'utf8', (err, data) => {
+      if (err) {
+        writeHeadWithSecurity(res, 404, { 'Content-Type': 'text/html; charset=utf-8' });
+        return res.end(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>文件未找到</title><style>body{font-family:system-ui,sans-serif;padding:40px;color:#333}h2{color:#c00}</style></head><body><h2>文件未找到</h2><p>${absPath.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</p></body></html>`);
+      }
+      const ext = path.extname(absPath).toLowerCase();
+      if (ext === '.md' || ext === '.markdown') {
+        // Render markdown to HTML
+        const body = data
+          .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        const htmlContent = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${path.basename(absPath).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</title>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<style>body{font-family:system-ui,sans-serif;font-size:15px;line-height:1.7;max-width:860px;margin:0 auto;padding:32px 24px;color:#222}pre{background:#f5f5f5;padding:12px;border-radius:4px;overflow-x:auto}code{background:#f0f0f0;padding:1px 5px;border-radius:3px;font-size:0.9em}pre code{background:none;padding:0}img{max-width:100%}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ddd;padding:6px 10px}th{background:#f5f5f5}blockquote{border-left:3px solid #ccc;margin:0;padding-left:14px;color:#666}a{color:#0066cc}hr{border:none;border-top:1px solid #ddd}</style>
+</head><body><div id="content"></div>
+<script>document.getElementById('content').innerHTML=marked.parse(${JSON.stringify(data)});</script>
+</body></html>`;
+        writeHeadWithSecurity(res, 200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' });
+        return res.end(htmlContent);
+      }
+      // Plain text / other text files
+      const mime = MIME_TYPES[ext] || 'text/plain; charset=utf-8';
+      writeHeadWithSecurity(res, 200, { 'Content-Type': mime, 'Cache-Control': 'no-cache' });
+      res.end(data);
+    });
+    return;
+  }
+
   if (req.method === 'DELETE' && url.pathname.startsWith('/api/attachments/')) {
     const token = extractBearerToken(req);
     if (!token || !hasActiveToken(token)) {

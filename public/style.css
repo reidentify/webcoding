@@ -1560,6 +1560,21 @@ body.session-loading-active {
   border: none;
   display: block;
 }
+.code-render-pane {
+  background: var(--bg);
+}
+.json-render-pre {
+  margin: 0;
+  padding: 12px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre;
+  overflow-x: auto;
+  color: var(--text);
+  max-height: 600px;
+  overflow-y: auto;
+}
 .code-block-wrapper.preview-mode .code-preview-pane { display: block; }
 .code-block-wrapper.preview-mode pre { display: none; }
 
@@ -2429,8 +2444,9 @@ body.session-loading-active {
 /* === Toast Notification === */
 .toast-notification {
   position: fixed;
-  top: 16px;
-  right: 16px;
+  top: calc(var(--header-height) + 10px);
+  left: 50%;
+  transform: translateX(-50%) translateY(-6px);
   background: var(--success);
   color: #fff;
   padding: 12px 20px;
@@ -2443,12 +2459,12 @@ body.session-loading-active {
   box-shadow: 4px 4px 0 var(--line);
   z-index: 200;
   opacity: 0;
-  transform: translateY(-10px);
   transition: opacity 0.3s, transform 0.3s;
+  white-space: nowrap;
 }
 .toast-notification.show {
   opacity: 1;
-  transform: translateY(0);
+  transform: translateX(-50%) translateY(0);
 }
 
 /* === Connection Status Indicator === */
@@ -2537,6 +2553,33 @@ body.ws-reconnecting::before {
   padding: 2px 8px;
 }
 .settings-panel h3 .settings-close:hover { /* keep explicit block for readability */ }
+/* Local file viewer */
+.localfile-body {
+  overflow: auto;
+  max-height: calc(80vh - 80px);
+}
+.localfile-iframe {
+  width: 100%;
+  height: calc(80vh - 80px);
+  border: none;
+  display: block;
+}
+.localfile-pre {
+  margin: 0;
+  padding: 16px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--text);
+  background: var(--bg);
+}
+.local-file-link {
+  color: var(--accent);
+  text-decoration: underline;
+  cursor: pointer;
+}
 .settings-header {
   display: flex;
   align-items: center;

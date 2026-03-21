@@ -1330,6 +1330,7 @@
 
   // --- marked config ---
   const PREVIEW_LANGS = new Set(['html', 'svg']);
+  const RENDER_LANGS = new Set(['md', 'markdown', 'json', 'csv']);
   const _previewCodeMap = new Map();
   let _previewCodeId = 0;
   const PREVIEW_SRCDOC_CSP = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data: https: http:; style-src 'unsafe-inline'; font-src data:; media-src data:; script-src 'none';">`;
@@ -1350,11 +1351,36 @@
     return `${PREVIEW_SRCDOC_CSP}${sanitizePreviewMarkup(markup)}`;
   }
 
+  function buildMarkdownSrcdoc(code) {
+    let html;
+    try { html = marked.parse(code); } catch { html = escapeHtml(code); }
+    return `${PREVIEW_SRCDOC_CSP}<style>body{font-family:system-ui,sans-serif;font-size:14px;line-height:1.6;padding:16px 20px;margin:0;color:#222;word-wrap:break-word}pre{background:#f5f5f5;padding:10px;border-radius:4px;overflow-x:auto}code{background:#f0f0f0;padding:1px 4px;border-radius:3px;font-size:0.9em}pre code{background:none;padding:0}img{max-width:100%}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ddd;padding:6px 10px;text-align:left}th{background:#f5f5f5}blockquote{border-left:3px solid #ccc;margin:0;padding-left:12px;color:#555}a{color:#0066cc}</style>${html}`;
+  }
+
+  function buildCsvSrcdoc(code) {
+    const rows = code.trim().split('\n').map(r => r.split(',').map(c => c.trim().replace(/^"|"$/g, '')));
+    const header = rows[0] || [];
+    const body = rows.slice(1);
+    const th = header.map(c => `<th>${escapeHtml(c)}</th>`).join('');
+    const tr = body.map(r => `<tr>${r.map(c => `<td>${escapeHtml(c)}</td>`).join('')}</tr>`).join('');
+    return `${PREVIEW_SRCDOC_CSP}<style>body{margin:0;padding:12px;font-family:system-ui,sans-serif;font-size:13px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ccc;padding:5px 10px;text-align:left}th{background:#f5f5f5;font-weight:600}tr:nth-child(even){background:#fafafa}</style><table><thead><tr>${th}</tr></thead><tbody>${tr}</tbody></table>`;
+  }
+
   const renderer = new marked.Renderer();
   renderer.html = function (html) {
     return escapeHtml(html || '');
   };
   renderer.link = function (href, title, text) {
+    // Detect absolute local file paths (e.g. /Users/... or /home/...)
+    const rawHref = String(href || '').trim();
+    if (/^\/[A-Za-z]/.test(rawHref) && !rawHref.startsWith('//')) {
+      return `<a href="#" class="local-file-link" data-path="${escapeHtml(rawHref)}" onclick="ccCopyFilePath(this);return false;" title="点击复制路径">${text || escapeHtml(rawHref)}</a>`;
+    }
+    // Detect relative local file paths with a known extension when cwd is available
+    if (sessionState.currentCwd && /^[^/#?][^#?]*\.[a-zA-Z0-9]+$/.test(rawHref) && !/^https?:\/\//i.test(rawHref)) {
+      const absPath = sessionState.currentCwd.replace(/\/$/, '') + '/' + rawHref;
+      return `<a href="#" class="local-file-link" data-path="${escapeHtml(absPath)}" onclick="ccCopyFilePath(this);return false;" title="点击复制路径">${text || escapeHtml(rawHref)}</a>`;
+    }
     const safeHref = normalizeSafeHref(href, { externalOnly: false, allowRelative: true });
     if (!safeHref) return text || '';
     const safeTitle = title ? ` title="${escapeHtml(title)}"` : '';
@@ -1381,18 +1407,24 @@
       highlighted = escapeHtml(code);
     }
     const canPreview = PREVIEW_LANGS.has(lang);
-    const previewBtn = canPreview
-      ? `<button class="code-preview-btn" onclick="ccTogglePreview(this)">Preview</button>`
+    const canRender = RENDER_LANGS.has(lang);
+    const hasAction = canPreview || canRender;
+    const btnLabel = canRender ? 'View' : 'Preview';
+    const renderType = canPreview ? 'html' : ((['md','markdown'].includes(lang)) ? 'md' : lang);
+    const actionBtn = hasAction
+      ? `<button class="code-preview-btn" onclick="ccTogglePreview(this)">${btnLabel}</button>`
       : '';
     const previewPane = canPreview
       ? `<div class="code-preview-pane"><iframe class="code-preview-iframe" sandbox="allow-same-origin" loading="lazy" referrerpolicy="no-referrer"></iframe></div>`
-      : '';
-    const cid = canPreview ? (++_previewCodeId) : 0;
-    if (canPreview) _previewCodeMap.set(cid, code);
-    return `<div class="code-block-wrapper${canPreview ? ' has-preview' : ''}"${canPreview ? ` data-cid="${cid}"` : ''}>
+      : canRender
+        ? `<div class="code-preview-pane code-render-pane" data-rtype="${escapeHtml(renderType)}"></div>`
+        : '';
+    const cid = hasAction ? (++_previewCodeId) : 0;
+    if (hasAction) _previewCodeMap.set(cid, code);
+    return `<div class="code-block-wrapper${hasAction ? ' has-preview' : ''}"${hasAction ? ` data-cid="${cid}"` : ''}>
       <div class="code-block-header">
         <span>${escapeHtml(lang)}</span>
-        <div class="code-block-actions">${previewBtn}<button class="code-copy-btn" onclick="ccCopyCode(this)">Copy</button></div>
+        <div class="code-block-actions">${actionBtn}<button class="code-copy-btn" onclick="ccCopyCode(this)">Copy</button></div>
       </div>
       ${previewPane}<pre><code class="hljs language-${escapeHtml(lang)}">${highlighted}</code></pre>
     </div>`;
@@ -1442,18 +1474,65 @@
     const inPreview = wrapper.classList.contains('preview-mode');
     if (inPreview) {
       wrapper.classList.remove('preview-mode');
-      btn.textContent = 'Preview';
+      // restore original button label based on pane type
+      const renderPane = wrapper.querySelector('.code-render-pane');
+      btn.textContent = renderPane ? 'View' : 'Preview';
     } else {
       const iframe = wrapper.querySelector('.code-preview-iframe');
+      const renderPane = wrapper.querySelector('.code-render-pane');
+      const cid = wrapper.dataset.cid ? Number(wrapper.dataset.cid) : 0;
+      const rawCode = (cid && _previewCodeMap.has(cid)) ? _previewCodeMap.get(cid) : '';
       if (iframe && !iframe.dataset.loaded) {
-        const cid = wrapper.dataset.cid ? Number(wrapper.dataset.cid) : 0;
-        const rawMarkup = (cid && _previewCodeMap.has(cid)) ? _previewCodeMap.get(cid) : '';
-        iframe.srcdoc = buildSafePreviewSrcdoc(rawMarkup);
+        iframe.srcdoc = buildSafePreviewSrcdoc(rawCode);
         iframe.dataset.loaded = '1';
+      } else if (renderPane && !renderPane.dataset.loaded) {
+        const rtype = renderPane.dataset.rtype || '';
+        if (rtype === 'md' || rtype === 'markdown') {
+          const iframe2 = document.createElement('iframe');
+          iframe2.className = 'code-preview-iframe';
+          iframe2.setAttribute('sandbox', 'allow-same-origin');
+          iframe2.setAttribute('referrerpolicy', 'no-referrer');
+          iframe2.srcdoc = buildMarkdownSrcdoc(rawCode);
+          renderPane.appendChild(iframe2);
+        } else if (rtype === 'csv') {
+          const iframe2 = document.createElement('iframe');
+          iframe2.className = 'code-preview-iframe';
+          iframe2.setAttribute('sandbox', 'allow-same-origin');
+          iframe2.setAttribute('referrerpolicy', 'no-referrer');
+          iframe2.srcdoc = buildCsvSrcdoc(rawCode);
+          renderPane.appendChild(iframe2);
+        } else if (rtype === 'json') {
+          const pre = document.createElement('pre');
+          pre.className = 'json-render-pre';
+          pre.textContent = (() => { try { return JSON.stringify(JSON.parse(rawCode), null, 2); } catch { return rawCode; } })();
+          renderPane.appendChild(pre);
+        }
+        renderPane.dataset.loaded = '1';
       }
       wrapper.classList.add('preview-mode');
       btn.textContent = 'Source';
     }
+  };
+
+  window.ccCopyFilePath = function (el) {
+    const filePath = el.dataset.path || '';
+    if (!filePath) return;
+    const copy = (text) => {
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        navigator.clipboard.writeText(text).then(() => showToast('路径已复制')).catch(() => {
+          const ta = document.createElement('textarea');
+          ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+          document.body.appendChild(ta); ta.select(); document.execCommand('copy');
+          document.body.removeChild(ta); showToast('路径已复制');
+        });
+      } else {
+        const ta = document.createElement('textarea');
+        ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+        document.body.appendChild(ta); ta.select(); document.execCommand('copy');
+        document.body.removeChild(ta); showToast('路径已复制');
+      }
+    };
+    copy(filePath);
   };
 
   // --- WebSocket ---
