@@ -25,7 +25,9 @@ if (fs.existsSync(envPath)) {
 }
 
 const PORT = parseInt(process.env.PORT) || 8001;
-const HOST = process.env.HOST || '0.0.0.0';
+// Ignore loopback-only HOST values (some cloud images set HOST=127.0.0.1 globally)
+const _HOST_ENV = process.env.HOST || '';
+const HOST = (_HOST_ENV && _HOST_ENV !== '127.0.0.1' && _HOST_ENV !== 'localhost') ? _HOST_ENV : '0.0.0.0';
 const CLAUDE_PATH = process.env.CLAUDE_PATH || 'claude';
 const CODEX_PATH = process.env.CODEX_PATH || 'codex';
 const CONFIG_DIR = process.env.CC_WEB_CONFIG_DIR || path.join(__dirname, 'config');
@@ -5391,6 +5393,15 @@ function handleMessage(ws, msg, options = {}) {
   fs.closeSync(inputFd);
   fs.closeSync(outputFd);
   fs.closeSync(errorFd);
+
+  // Handle spawn errors (e.g. ENOENT when CLI binary not found) — must be registered
+  // immediately after spawn, before any async work, to avoid unhandled 'error' event crash.
+  proc.on('error', (err) => {
+    plog('ERROR', 'process_spawn_fail', { sessionId: currentSessionId.slice(0, 8), error: err.message });
+    cleanRunDir(currentSessionId);
+    const agent = getSessionAgent(session);
+    wsSend(ws, { type: 'error', message: formatRuntimeError(agent, err.message, { exitCode: null, signal: null }) });
+  });
 
   fs.writeFileSync(path.join(dir, 'pid'), String(proc.pid));
   proc.unref(); // Process survives Node.js exit

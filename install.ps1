@@ -28,6 +28,22 @@ if ([int]$nodeVer -lt 18) {
 
 Write-Success "Node.js $(node -v)  npm $(npm -v)  git $(git --version) — 全部就绪"
 
+# ── 检测 AI CLI（非必须，至少需要一个）────────────────────────
+$hasClaude = [bool](Get-Command claude -ErrorAction SilentlyContinue)
+$hasCodex  = [bool](Get-Command codex  -ErrorAction SilentlyContinue)
+if ($hasClaude -and $hasCodex) {
+    Write-Success '检测到 Claude CLI 和 Codex CLI'
+} elseif ($hasClaude) {
+    Write-Warn '仅检测到 Claude CLI（未找到 codex），Codex 功能将不可用'
+} elseif ($hasCodex) {
+    Write-Warn '仅检测到 Codex CLI（未找到 claude），Claude 功能将不可用'
+} else {
+    Write-Warn '未检测到 Claude CLI 或 Codex CLI'
+    Write-Warn '请至少安装其中一个后再使用:'
+    Write-Warn '  Claude CLI : https://docs.anthropic.com/en/docs/claude-code'
+    Write-Warn '  Codex CLI  : https://github.com/openai/codex'
+}
+
 # ── 安装 / 更新 ────────────────────────────────────────────────
 if (Test-Path (Join-Path $INSTALL_DIR '.git')) {
     Write-Warn "检测到已有安装目录: $INSTALL_DIR"

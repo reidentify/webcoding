@@ -36,6 +36,23 @@ fi
 
 success "Node.js $(node -v)  npm $(npm -v)  git $(git --version | awk '{print $3}') — 全部就绪"
 
+# ── 检测 AI CLI（非必须，至少需要一个）────────────────────────
+HAS_CLAUDE=false; HAS_CODEX=false
+command -v claude >/dev/null 2>&1 && HAS_CLAUDE=true
+command -v codex  >/dev/null 2>&1 && HAS_CODEX=true
+if [ "$HAS_CLAUDE" = true ] && [ "$HAS_CODEX" = true ]; then
+  success "检测到 Claude CLI 和 Codex CLI"
+elif [ "$HAS_CLAUDE" = true ]; then
+  warn "仅检测到 Claude CLI（未找到 codex），Codex 功能将不可用"
+elif [ "$HAS_CODEX" = true ]; then
+  warn "仅检测到 Codex CLI（未找到 claude），Claude 功能将不可用"
+else
+  warn "未检测到 Claude CLI 或 Codex CLI"
+  warn "请至少安装其中一个后再使用:"
+  warn "  Claude CLI : https://docs.anthropic.com/en/docs/claude-code"
+  warn "  Codex CLI  : https://github.com/openai/codex"
+fi
+
 # ── 安装 / 更新 ────────────────────────────────────────────────
 if [ -d "$INSTALL_DIR/.git" ]; then
   warn "检测到已有安装目录: $INSTALL_DIR"
