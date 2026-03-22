@@ -5379,6 +5379,29 @@ function handleMessage(ws, msg, options = {}) {
       stdio: [inputFd, outputFd, errorFd],
       detached: !IS_WIN,
       windowsHide: true,
+      shell: !!spawnSpec.useShell,
+    });
+    proc.once('error', (err) => {
+      const agent = getSessionAgent(session);
+      const message = formatRuntimeError(agent, err.message, { exitCode: null, signal: null });
+      plog('ERROR', 'process_spawn_error_event', {
+        sessionId: currentSessionId.slice(0, 8),
+        agent,
+        error: err.message,
+      });
+      if (entry?.tailer) {
+        try { entry.tailer.stop(); } catch {}
+      }
+      if (entry) entry.errorSent = true;
+      removeActiveProcess(currentSessionId);
+      cleanRunDir(currentSessionId);
+      const targetWs = entry?.ws && entry.ws.readyState === 1
+        ? entry.ws
+        : (ws && ws.readyState === 1 ? ws : null);
+      if (targetWs) {
+        wsSend(targetWs, { type: 'error', message });
+        sendSessionList(targetWs);
+      }
     });
   } catch (err) {
     fs.closeSync(inputFd);
