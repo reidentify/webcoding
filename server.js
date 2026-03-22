@@ -5555,12 +5555,12 @@ const {
 // === Check Update ===
 function handleCheckUpdate(ws) {
   const localVersion = (() => {
+    try { return JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')).version || 'unknown'; } catch {}
     try {
       const cl = fs.readFileSync(path.join(__dirname, 'CHANGELOG.md'), 'utf8');
       const m = cl.match(/##\s*v([\d.]+)/) || cl.match(/\*\*v([\d.]+)\*\*/);
       if (m) return m[1];
     } catch {}
-    try { return JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')).version || 'unknown'; } catch {}
     return 'unknown';
   })();
 
