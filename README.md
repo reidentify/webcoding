@@ -60,23 +60,39 @@ https://github.com/HsMirage/webcoding 给我装！
 
 ## 快速开始
 
-### Linux / macOS
+### 一键安装（推荐）
 
+**Linux / macOS**
+```bash
+curl -fsSL https://raw.githubusercontent.com/HsMirage/webcoding/main/install.sh | bash
+```
+
+**Windows（PowerShell）**
+```powershell
+irm https://raw.githubusercontent.com/HsMirage/webcoding/main/install.ps1 | iex
+```
+
+安装完成后会提示是否立即启动，访问 `http://localhost:8001` 输入密码即可使用。
+
+> 指定安装目录：
+> - Linux/macOS: `curl -fsSL ... | bash -s -- ~/mydir`
+> - Windows: `$env:WEBCODING_DIR="C:\mydir"; irm ... | iex`
+
+### 手动安装
+
+**Linux / macOS**
 ```bash
 git clone https://github.com/HsMirage/webcoding.git
 cd webcoding
 npm install
-cp .env.example .env    # 可选，不设密码则首次启动自动生成
 npm start
 ```
 
-### Windows
-
+**Windows**
 ```cmd
 git clone https://github.com/HsMirage/webcoding.git
 cd webcoding
 npm install
-copy .env.example .env  & REM 可选
 ```
 然后双击 `start.bat`，或在终端运行 `node server.js`。
 

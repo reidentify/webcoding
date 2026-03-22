@@ -40,25 +40,40 @@ npm install -g @openai/codex
 
 ## Quick Start
 
-### Linux / macOS
+### One-line install (recommended)
 
+**Linux / macOS**
+```bash
+curl -fsSL https://raw.githubusercontent.com/HsMirage/webcoding/main/install.sh | bash
+```
+
+**Windows (PowerShell)**
+```powershell
+irm https://raw.githubusercontent.com/HsMirage/webcoding/main/install.ps1 | iex
+```
+
+The script checks for Node.js ≥ 18 and git, clones the repo, installs dependencies, adds a `webcoding` launcher to your PATH, and optionally starts the server immediately.
+
+> Custom install directory:
+> - Linux/macOS: `curl -fsSL ... | bash -s -- ~/mydir`
+> - Windows: `$env:WEBCODING_DIR="C:\mydir"; irm ... | iex`
+
+### Manual install
+
+**Linux / macOS**
 ```bash
 git clone https://github.com/HsMirage/webcoding.git
 cd webcoding
 npm install
-cp .env.example .env    # optional; if omitted, an initial password is auto-generated
 npm start
 ```
 
-### Windows
-
+**Windows**
 ```cmd
 git clone https://github.com/HsMirage/webcoding.git
 cd webcoding
 npm install
-copy .env.example .env  & REM optional
 ```
-
 Then run `start.bat`, or start manually with `node server.js`.
 
 After startup, open `http://localhost:8001` and sign in with your password.
